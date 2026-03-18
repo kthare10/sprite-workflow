@@ -37,16 +37,40 @@ Two YAML config files drive the workflow:
 - **`download_config.yaml`** — S3 source, product, date range, station list, chunking
 - **`experiment_config.yaml`** — paths, sites, windows, freeze settings, FL/centralized training params, Slurm settings
 
+Both configs use **placeholder tokens** instead of hardcoded paths:
+
+| Token | Replaced by | CLI flag | Env var fallback |
+|-------|-------------|----------|-----------------|
+| `__DATA_ROOT__` | Data storage root | `--data-root` | `$DATA_ROOT` |
+| `__FL_ROOT__` | Federated-learning code root | `--fl-root` | `$FL_ROOT` |
+
+At DAG generation time, `workflow_generator.py` reads the template configs, substitutes the placeholders with the resolved paths, and writes the resolved copies to `scratch/resolved_configs/`. The resolved configs are registered with Pegasus and passed to container jobs. `DATA_ROOT` and `FL_ROOT` are also injected as environment variables into every container job.
+
 Sites are read from `experiment_config.yaml` at DAG generation time to create parallel per-site branches.
 
 ## Usage
 
+### Install dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
 ### Generate the DAG
 
 ```bash
+# Minimal — uses $DATA_ROOT / $FL_ROOT env vars (or built-in defaults)
 python workflow_generator.py \
     --download-config download_config.yaml \
     --experiment-config experiment_config.yaml \
+    --output workflow.yml
+
+# Explicit roots
+python workflow_generator.py \
+    --download-config download_config.yaml \
+    --experiment-config experiment_config.yaml \
+    --data-root /data/MRMS/S3_V2 \
+    --fl-root /opt/SPRITE \
     --output workflow.yml
 ```
 
@@ -65,6 +89,8 @@ pegasus-status <run-dir>
 -o, --output                 Output file (default: workflow.yml)
 --download-config            Path to download_config.yaml (required)
 --experiment-config          Path to experiment_config.yaml (required)
+--data-root PATH             Data storage root (default: $DATA_ROOT or /home/ubuntu/data/MRMS/S3_V2)
+--fl-root PATH               Federated-learning code root (default: $FL_ROOT)
 ```
 
 ## Container
