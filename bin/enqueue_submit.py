@@ -1,4 +1,4 @@
-#!/home/ubuntu/sprite-venv/bin/python3
+#!/usr/bin/env python3
 
 """Write run configs and submit FL/centralized training jobs.
 

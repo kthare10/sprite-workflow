@@ -1,4 +1,4 @@
-#!/home/ubuntu/sprite-venv/bin/python3
+#!/usr/bin/env python3
 
 """Merge all site snapshots into a central snapshot.
 

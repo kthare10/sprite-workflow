@@ -113,6 +113,7 @@ class SpriteFlWorkflow:
     # ------------------------------------------------------------------
     def create_pegasus_properties(self):
         self.props = Properties()
+        self.props["pegasus.data.configuration"] = "condorio"
         self.props["pegasus.transfer.threads"] = "16"
 
     # ------------------------------------------------------------------
@@ -134,15 +135,13 @@ class SpriteFlWorkflow:
             ),
         )
 
-        if exec_site_name == "local":
-            self.sc.add_sites(local)
-        else:
-            exec_site = (
-                Site(exec_site_name)
-                .add_condor_profile(universe="vanilla")
-                .add_pegasus_profile(style="condor")
-            )
-            self.sc.add_sites(local, exec_site)
+        exec_site = (
+            Site(exec_site_name)
+            .add_condor_profile(universe="vanilla")
+            .add_pegasus_profile(style="condor")
+        )
+
+        self.sc.add_sites(local, exec_site)
 
     # ------------------------------------------------------------------
     # Transformation Catalog
@@ -150,36 +149,23 @@ class SpriteFlWorkflow:
     def create_transformation_catalog(self, exec_site_name="condorpool"):
         self.tc = TransformationCatalog()
 
-        # Use container only for remote execution sites
-        container = None
-        if exec_site_name != "local":
-            container = Container(
-                "sprite_fl_container",
-                container_type=Container.SINGULARITY,
-                image="docker://kthare10/sprite-fl:latest",
-                image_site="docker_hub",
-            )
-            self.tc.add_containers(container)
+        container = Container(
+            "sprite_fl_container",
+            container_type=Container.SINGULARITY,
+            image="docker://kthare10/sprite-fl:latest",
+            image_site="docker_hub",
+        )
+        self.tc.add_containers(container)
 
         transformations = []
         for tool_name, config in TOOL_CONFIGS.items():
-            if exec_site_name == "local":
-                # For local execution, use installed transformation
-                tx = Transformation(
-                    tool_name,
-                    site="local",
-                    pfn=os.path.join(self.wf_dir, f"bin/{tool_name}.py"),
-                    is_stageable=False,
-                )
-            else:
-                tx = Transformation(
-                    tool_name,
-                    site=exec_site_name,
-                    pfn=os.path.join(self.wf_dir, f"bin/{tool_name}.py"),
-                    is_stageable=True,
-                )
-                if container:
-                    tx.container = container
+            tx = Transformation(
+                tool_name,
+                site=exec_site_name,
+                pfn=os.path.join(self.wf_dir, f"bin/{tool_name}.py"),
+                is_stageable=True,
+                container=container,
+            )
             tx.add_pegasus_profile(
                 memory=config["memory"], cores=config.get("cores", 1)
             )
