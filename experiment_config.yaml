@@ -1,9 +1,9 @@
 paths:
-  raw_root: "/home/ubuntu/data/MRMS/S3_V2/raw_store"         # Raw data root
-  nc_subset_root: "/home/ubuntu/data/MRMS/S3_V2/nc_subset"   # Preprocessed output root
-  snapshot_root: "/home/ubuntu/data/MRMS/S3_V2/snapshots"
-  runs_root: "/home/ubuntu/data/MRMS/S3_V2/runs"
-  db_dir: "/home/ubuntu/data/MRMS/S3_V2/_meta"
+  raw_root: "__DATA_ROOT__/raw_store"
+  nc_subset_root: "__DATA_ROOT__/nc_subset"
+  snapshot_root: "__DATA_ROOT__/snapshots"
+  runs_root: "__DATA_ROOT__/runs"
+  db_dir: "__DATA_ROOT__/_meta"
 
 sites: [
   "KBOX",
@@ -53,23 +53,17 @@ freeze:
 #  product: "PrecipRate"
 #  step_minutes: 2
 
-validation_policy:
-  name: "temporal_tail"
-  tail_days: 3
-  gap_hours: 2
-  seed: 20250925
-
 fl:
   server_addr: "127.0.0.1:8080"
   rounds: 50
   local_steps: 2
   clients_concurrency: 4
   min_clients_to_start: 2
-  uv_activate: "source /home/zhexu/UMASS/SPRITE/federated_learning/.venv/bin/activate "
-  clients_map_template: "/home/zhexu/UMASS/SPRITE/federated_learning/src/flower/generationStep_and_data_splitting/clients.map.json"
+  uv_activate: "source __FL_ROOT__/federated_learning/.venv/bin/activate "
+  clients_map_template: "__FL_ROOT__/federated_learning/src/flower/generationStep_and_data_splitting/clients.map.json"
 
 centralized:
-  uv_activate: "source /home/zhexu/UMASS/SPRITE/federated_learning/.venv/bin/activate "
+  uv_activate: "source __FL_ROOT__/federated_learning/.venv/bin/activate "
   run_centra_sh: "./run_centra.sh"
 
 slurm:
@@ -100,7 +94,6 @@ raw_layout: "site/split/day"  # raw_store/{SITE}/{train|test}/{YYYYMMDD}/*.nc
 preprocessor:
   enabled: true
   # Prefer in-process helper call; only the config path is needed
-  config_yaml: "/home/zhexu/UMASS/SPRITE/casa_datatools/src/casa_datatools/processing_data/data_processing_config.yml"
+  config_yaml: "__FL_ROOT__/casa_datatools/src/casa_datatools/processing_data/data_processing_config.yml"
   # To force a subprocess entry point, provide entry_py and set prefer_inproc to false (see code toggle)
   # entry_py: "/work/pi_mzink_umass_edu/SPRITE/federated/run_preprocessor.py"
-

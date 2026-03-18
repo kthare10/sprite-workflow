@@ -1,0 +1,9 @@
+boto3
+xarray
+netCDF4
+scipy
+cfgrib
+pyyaml
+numpy
+pandas
+eccodes

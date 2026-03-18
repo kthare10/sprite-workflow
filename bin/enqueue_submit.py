@@ -173,9 +173,14 @@ def main():
     logger.info(f"FL rounds: {fl_cfg.get('rounds', 'N/A')}")
     logger.info(f"Slurm partition: {slurm_cfg.get('partition', 'N/A')}")
 
-    conn = sqlite3.connect(db_path, timeout=120)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=120000")
+    try:
+        conn = sqlite3.connect(db_path, timeout=120)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=120000")
+    except sqlite3.Error as e:
+        logger.error(f"Failed to open database {db_path}: {e}")
+        sys.exit(1)
+
     now = datetime.utcnow().isoformat() + "Z"
     submitted_jobs = []
 
@@ -199,66 +204,72 @@ def main():
     for window, span_key in sorted(span_combos):
         span_dir_name = f"span_{span_key}"
 
-        # FL run
-        fl_run_dir = os.path.join(runs_root, "fl", window, span_dir_name, "run_001")
-        write_fl_configs(fl_run_dir, config, sites, snapshot_root, window, span_key)
+        try:
+            # FL run
+            fl_run_dir = os.path.join(runs_root, "fl", window, span_dir_name, "run_001")
+            write_fl_configs(fl_run_dir, config, sites, snapshot_root, window, span_key)
 
-        # Write _RUNNING marker
-        with open(os.path.join(fl_run_dir, "_RUNNING"), "w") as f:
-            pass
+            # Write _RUNNING marker
+            with open(os.path.join(fl_run_dir, "_RUNNING"), "w") as f:
+                pass
 
-        fl_payload = {
-            "run_dir": fl_run_dir,
-            "fl_server_data_dir": os.path.join(
-                snapshot_root, "central", NORM_TAG, PRECIP_TAG,
-                window, VERSION, span_dir_name,
-            ),
-        }
-        cursor = conn.execute(
-            """INSERT INTO jobs (kind, window, span, site, status, slurm_id,
-                                retries, payload_json, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?)""",
-            ("train_fl", window, span_key, "", "queued", None,
-             0, json.dumps(fl_payload), now, now),
-        )
-        fl_job_id = cursor.lastrowid
-        submitted_jobs.append({
-            "job_id": fl_job_id,
-            "kind": "train_fl",
-            "window": window,
-            "span": span_key,
-            "run_dir": fl_run_dir,
-        })
+            fl_payload = {
+                "run_dir": fl_run_dir,
+                "fl_server_data_dir": os.path.join(
+                    snapshot_root, "central", NORM_TAG, PRECIP_TAG,
+                    window, VERSION, span_dir_name,
+                ),
+            }
+            cursor = conn.execute(
+                """INSERT INTO jobs (kind, window, span, site, status, slurm_id,
+                                    retries, payload_json, created_at, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                ("train_fl", window, span_key, "", "queued", None,
+                 0, json.dumps(fl_payload), now, now),
+            )
+            fl_job_id = cursor.lastrowid
+            submitted_jobs.append({
+                "job_id": fl_job_id,
+                "kind": "train_fl",
+                "window": window,
+                "span": span_key,
+                "run_dir": fl_run_dir,
+            })
 
-        # CEN run
-        cen_run_dir = os.path.join(runs_root, "cen", window, span_dir_name, "run_001")
-        write_cen_configs(cen_run_dir, config, snapshot_root, window, span_key)
+            # CEN run
+            cen_run_dir = os.path.join(runs_root, "cen", window, span_dir_name, "run_001")
+            write_cen_configs(cen_run_dir, config, snapshot_root, window, span_key)
 
-        # Write _RUNNING marker
-        with open(os.path.join(cen_run_dir, "_RUNNING"), "w") as f:
-            pass
+            # Write _RUNNING marker
+            with open(os.path.join(cen_run_dir, "_RUNNING"), "w") as f:
+                pass
 
-        cen_payload = {
-            "run_dir": cen_run_dir,
-        }
-        cursor = conn.execute(
-            """INSERT INTO jobs (kind, window, span, site, status, slurm_id,
-                                retries, payload_json, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?)""",
-            ("train_cen", window, span_key, "", "queued", None,
-             0, json.dumps(cen_payload), now, now),
-        )
-        cen_job_id = cursor.lastrowid
-        submitted_jobs.append({
-            "job_id": cen_job_id,
-            "kind": "train_cen",
-            "window": window,
-            "span": span_key,
-            "run_dir": cen_run_dir,
-        })
+            cen_payload = {
+                "run_dir": cen_run_dir,
+            }
+            cursor = conn.execute(
+                """INSERT INTO jobs (kind, window, span, site, status, slurm_id,
+                                    retries, payload_json, created_at, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                ("train_cen", window, span_key, "", "queued", None,
+                 0, json.dumps(cen_payload), now, now),
+            )
+            cen_job_id = cursor.lastrowid
+            submitted_jobs.append({
+                "job_id": cen_job_id,
+                "kind": "train_cen",
+                "window": window,
+                "span": span_key,
+                "run_dir": cen_run_dir,
+            })
 
-        logger.info(f"Enqueued FL job {fl_job_id} and CEN job {cen_job_id} "
-                     f"for {window}/{span_dir_name}")
+            logger.info(f"Enqueued FL job {fl_job_id} and CEN job {cen_job_id} "
+                         f"for {window}/{span_dir_name}")
+
+        except (sqlite3.Error, OSError) as e:
+            logger.error(f"Failed to enqueue jobs for {window}/{span_dir_name}: {e}")
+            conn.rollback()
+            continue
 
     conn.commit()
     conn.close()

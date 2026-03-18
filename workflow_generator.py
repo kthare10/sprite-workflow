@@ -25,12 +25,15 @@ Usage:
     ./workflow_generator.py \\
         --download-config download_config.yaml \\
         --experiment-config experiment_config.yaml \\
+        --data-root /data/MRMS/S3_V2 \\
+        --fl-root /opt/SPRITE \\
         -e condorpool --output workflow.yml
 """
 
 import argparse
 import logging
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -57,6 +60,22 @@ TOOL_CONFIGS = {
     "finalize_report":   {"memory": "1 GB",  "cores": 1},
 }
 
+# Placeholder tokens replaced at DAG-generation time
+_DATA_ROOT_TOKEN = "__DATA_ROOT__"
+_FL_ROOT_TOKEN = "__FL_ROOT__"
+
+
+def resolve_config(template_path, out_path, data_root, fl_root):
+    """Read a YAML config template, replace placeholders, write resolved copy."""
+    with open(template_path, "r") as f:
+        text = f.read()
+    text = text.replace(_DATA_ROOT_TOKEN, data_root)
+    text = text.replace(_FL_ROOT_TOKEN, fl_root)
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    with open(out_path, "w") as f:
+        f.write(text)
+    return out_path
+
 
 class SpriteFlWorkflow:
     """Pegasus workflow for SPRITE Federated Learning pipeline."""
@@ -77,6 +96,14 @@ class SpriteFlWorkflow:
     download_config_path = None
     experiment_config_path = None
 
+    # Resolved config paths (written to scratch dir)
+    resolved_download_config_path = None
+    resolved_experiment_config_path = None
+
+    # Root paths for placeholder substitution
+    data_root = None
+    fl_root = None
+
     # Parsed configs
     download_config = None
     experiment_config = None
@@ -88,10 +115,26 @@ class SpriteFlWorkflow:
         self.local_storage_dir = os.path.join(self.wf_dir, "output")
 
     def load_configs(self):
-        """Load and parse YAML config files."""
-        with open(self.download_config_path, "r") as f:
+        """Load config templates, resolve placeholders, and parse YAML."""
+        data_root = self.data_root or ""
+        fl_root = self.fl_root or ""
+
+        resolved_dir = os.path.join(self.shared_scratch_dir, "resolved_configs")
+
+        self.resolved_download_config_path = resolve_config(
+            self.download_config_path,
+            os.path.join(resolved_dir, "download_config.yaml"),
+            data_root, fl_root,
+        )
+        self.resolved_experiment_config_path = resolve_config(
+            self.experiment_config_path,
+            os.path.join(resolved_dir, "experiment_config.yaml"),
+            data_root, fl_root,
+        )
+
+        with open(self.resolved_download_config_path, "r") as f:
             self.download_config = yaml.safe_load(f)
-        with open(self.experiment_config_path, "r") as f:
+        with open(self.resolved_experiment_config_path, "r") as f:
             self.experiment_config = yaml.safe_load(f)
 
     @property
@@ -179,17 +222,28 @@ class SpriteFlWorkflow:
     def create_replica_catalog(self):
         self.rc = ReplicaCatalog()
 
-        # Register config files as input replicas
-        if self.download_config_path:
+        # Register resolved config files as input replicas
+        if self.resolved_download_config_path:
             self.rc.add_replica(
                 "local", "download_config.yaml",
-                "file://" + os.path.abspath(self.download_config_path)
+                "file://" + os.path.abspath(self.resolved_download_config_path)
             )
-        if self.experiment_config_path:
+        if self.resolved_experiment_config_path:
             self.rc.add_replica(
                 "local", "experiment_config.yaml",
-                "file://" + os.path.abspath(self.experiment_config_path)
+                "file://" + os.path.abspath(self.resolved_experiment_config_path)
             )
+
+    # ------------------------------------------------------------------
+    # Helper: add env vars to a job
+    # ------------------------------------------------------------------
+    def _add_env(self, job):
+        """Attach DATA_ROOT and FL_ROOT environment variables to a job."""
+        if self.data_root:
+            job.add_env(DATA_ROOT=self.data_root)
+        if self.fl_root:
+            job.add_env(FL_ROOT=self.fl_root)
+        return job
 
     # ------------------------------------------------------------------
     # Workflow DAG
@@ -219,6 +273,7 @@ class SpriteFlWorkflow:
             .add_outputs(download_marker, stage_out=True,
                          register_replica=False)
         )
+        self._add_env(download_job)
         self.wf.add_jobs(download_job)
 
         # ============================================================
@@ -237,6 +292,7 @@ class SpriteFlWorkflow:
             .add_outputs(inventory_marker, stage_out=True,
                          register_replica=False)
         )
+        self._add_env(inventory_job)
         self.wf.add_jobs(inventory_job)
 
         # ============================================================
@@ -255,6 +311,7 @@ class SpriteFlWorkflow:
             .add_outputs(plan_spans_marker, stage_out=True,
                          register_replica=False)
         )
+        self._add_env(plan_spans_job)
         self.wf.add_jobs(plan_spans_job)
 
         # ============================================================
@@ -282,6 +339,7 @@ class SpriteFlWorkflow:
                 .add_outputs(freeze_marker, stage_out=True,
                              register_replica=False)
             )
+            self._add_env(freeze_job)
             self.wf.add_jobs(freeze_job)
 
             # Step 5: Preprocess frozen data (per-site)
@@ -300,6 +358,7 @@ class SpriteFlWorkflow:
                 .add_outputs(preproc_marker, stage_out=True,
                              register_replica=False)
             )
+            self._add_env(preproc_job)
             self.wf.add_jobs(preproc_job)
 
             # Step 6a: Site snapshot (per-site)
@@ -318,6 +377,7 @@ class SpriteFlWorkflow:
                 .add_outputs(snapshot_marker, stage_out=True,
                              register_replica=False)
             )
+            self._add_env(snapshot_job)
             self.wf.add_jobs(snapshot_job)
 
             site_snapshot_markers.append(snapshot_marker)
@@ -343,6 +403,7 @@ class SpriteFlWorkflow:
         central_snapshot_job.add_outputs(
             central_snapshot_marker, stage_out=True, register_replica=False
         )
+        self._add_env(central_snapshot_job)
         self.wf.add_jobs(central_snapshot_job)
 
         # ============================================================
@@ -362,6 +423,7 @@ class SpriteFlWorkflow:
             .add_outputs(enqueue_submit_marker, stage_out=True,
                          register_replica=False)
         )
+        self._add_env(enqueue_submit_job)
         self.wf.add_jobs(enqueue_submit_job)
 
         # ============================================================
@@ -380,6 +442,7 @@ class SpriteFlWorkflow:
             .add_outputs(poll_retry_marker, stage_out=True,
                          register_replica=False)
         )
+        self._add_env(poll_retry_job)
         self.wf.add_jobs(poll_retry_job)
 
         # ============================================================
@@ -399,6 +462,7 @@ class SpriteFlWorkflow:
             .add_outputs(final_report, stage_out=True,
                          register_replica=False)
         )
+        self._add_env(finalize_job)
         self.wf.add_jobs(finalize_job)
 
 
@@ -416,6 +480,7 @@ Examples:
 
   %(prog)s --download-config download_config.yaml \\
            --experiment-config experiment_config.yaml \\
+           --data-root /data/MRMS/S3_V2 --fl-root /opt/SPRITE \\
            -e condorpool --output workflow.yml
 """,
     )
@@ -444,6 +509,18 @@ Examples:
         "--experiment-config", required=True,
         help="Path to experiment_config.yaml",
     )
+    parser.add_argument(
+        "--data-root", metavar="PATH",
+        default=os.environ.get("DATA_ROOT", "/home/ubuntu/data/MRMS/S3_V2"),
+        help="Root directory for data storage (replaces __DATA_ROOT__ in configs). "
+             "Default: $DATA_ROOT or /home/ubuntu/data/MRMS/S3_V2",
+    )
+    parser.add_argument(
+        "--fl-root", metavar="PATH",
+        default=os.environ.get("FL_ROOT", ""),
+        help="Root directory for federated-learning code (replaces __FL_ROOT__ in configs). "
+             "Default: $FL_ROOT env var",
+    )
 
     args = parser.parse_args()
 
@@ -462,6 +539,8 @@ Examples:
     logger.info(f"Download config:  {args.download_config}")
     logger.info(f"Experiment config: {args.experiment_config}")
     logger.info(f"Execution site:   {args.execution_site_name}")
+    logger.info(f"Data root:        {args.data_root}")
+    logger.info(f"FL root:          {args.fl_root}")
     logger.info(f"Output file:      {args.output}")
     logger.info("=" * 70)
 
@@ -469,6 +548,8 @@ Examples:
         workflow = SpriteFlWorkflow(dagfile=args.output)
         workflow.download_config_path = args.download_config
         workflow.experiment_config_path = args.experiment_config
+        workflow.data_root = args.data_root
+        workflow.fl_root = args.fl_root
         workflow.load_configs()
 
         logger.info(f"Sites: {workflow.sites}")

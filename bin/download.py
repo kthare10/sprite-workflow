@@ -98,12 +98,7 @@ def download_and_convert_file(
             # Handle longitude convention (MRMS uses 0-360)
             lon_vals = ds[lon_coord].values
             if lon_vals.max() > 180:
-                lon_360 = lon % 360 if lon < 0 else lon + 360 if lon < 0 else lon
-                # For negative longitudes, convert to 0-360
-                if lon < 0:
-                    lon_360 = lon + 360
-                else:
-                    lon_360 = lon
+                lon_360 = lon + 360 if lon < 0 else lon
                 lon_min_sel = lon_360 - clip_deg
                 lon_max_sel = lon_360 + clip_deg
             else:

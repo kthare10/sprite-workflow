@@ -114,10 +114,6 @@ def main():
     db_path = os.path.join(db_dir, "sprite.sqlite") if db_dir else "sprite.sqlite"
     splits = config.get("splits", ["train", "test"])
 
-    # Also handle validation split if present in reference
-    validation_cfg = config.get("validation_policy", {})
-    tail_days = validation_cfg.get("tail_days", 3)
-
     frozen_months = freeze_marker.get("frozen_months", [])
 
     logger.info(f"NC subset root: {nc_subset_root}")

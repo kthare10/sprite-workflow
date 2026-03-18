@@ -13,12 +13,12 @@ split:
   seed: 2025
   scope: ts
 output:
-  root: /home/ubuntu/data/MRMS/S3_V2/download_opt
-  nc_subset: /home/ubuntu/data/MRMS/S3_V2/raw_store
-  chunk_records_dir: /home/ubuntu/data/MRMS/S3_V2/logs/downloading/chunk_records
+  root: __DATA_ROOT__/download_opt
+  nc_subset: __DATA_ROOT__/raw_store
+  chunk_records_dir: __DATA_ROOT__/logs/downloading/chunk_records
 audit:
-  db_dir: /home/ubuntu/data/MRMS/S3_V2/_meta
-  manifest_dir: /home/ubuntu/data/MRMS/S3_V2/_meta/freeze_manifests
+  db_dir: __DATA_ROOT__/_meta
+  manifest_dir: __DATA_ROOT__/_meta/freeze_manifests
   datasource: s3
   freeze_lag_days: 3
   missing_ratio_tol:

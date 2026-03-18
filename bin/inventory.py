@@ -128,8 +128,12 @@ def main():
                         continue
 
                     nc_path = os.path.join(day_path, nc_file)
-                    size = os.path.getsize(nc_path)
-                    sha1 = sha1_file(nc_path)
+                    try:
+                        size = os.path.getsize(nc_path)
+                        sha1 = sha1_file(nc_path)
+                    except OSError as e:
+                        logger.warning(f"Skipping {nc_path}: {e}")
+                        continue
 
                     # Parse ts from filename: YYYYMMDD_HHMMSS.nc
                     ts = nc_file.replace(".nc", "")

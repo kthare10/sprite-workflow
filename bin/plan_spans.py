@@ -119,11 +119,19 @@ def main():
 
     logger.info(f"Config: {args.config}")
 
-    with open(args.config, "r") as f:
-        config = yaml.safe_load(f)
+    try:
+        with open(args.config, "r") as f:
+            config = yaml.safe_load(f)
+    except (OSError, yaml.YAMLError) as e:
+        logger.error(f"Failed to read config {args.config}: {e}")
+        sys.exit(1)
 
-    with open(args.inventory_marker, "r") as f:
-        inv_marker = json.load(f)
+    try:
+        with open(args.inventory_marker, "r") as f:
+            inv_marker = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        logger.error(f"Failed to read inventory marker {args.inventory_marker}: {e}")
+        sys.exit(1)
 
     out_dir = os.path.dirname(args.output_marker)
     if out_dir:
