@@ -1,0 +1,78 @@
+source: s3
+product: PrecipRate
+wgrib2_path: ../wgrib2
+chunks: 44
+sample_step: 1
+clip_degrees: 3
+retries:
+  max_attempts: 3
+  base_delay_seconds: 5
+split:
+  mode: random
+  ratio: 0.2
+  seed: 2025
+  scope: ts
+output:
+  root: /home/ubuntu/data/MRMS/S3_V2/download_opt
+  nc_subset: /home/ubuntu/data/MRMS/S3_V2/raw_store
+  chunk_records_dir: /home/ubuntu/data/MRMS/S3_V2/logs/downloading/chunk_records
+audit:
+  db_dir: /home/ubuntu/data/MRMS/S3_V2/_meta
+  manifest_dir: /home/ubuntu/data/MRMS/S3_V2/_meta/freeze_manifests
+  datasource: s3
+  freeze_lag_days: 3
+  missing_ratio_tol:
+    train: 0.25
+    test: 0.85
+  region: CONUS
+  product: PrecipRate
+  step_minutes: 2
+stations:
+  KYUX:
+    latitude: 32.495281
+    longitude: -114.65671
+    region: CONUS
+  KBYX:
+    latitude: 24.5975
+    longitude: -81.703167
+    region: CONUS
+  KTLX:
+    latitude: 35.333361
+    longitude: -97.277761
+    region: CONUS
+  KVNX:
+    latitude: 36.740617
+    longitude: -98.127717
+    region: CONUS
+  KLGX:
+    latitude: 47.116944
+    longitude: -124.10666
+    region: CONUS
+  PAHG:
+    latitude: 60.725914
+    longitude: -151.35146
+    region: ALASKA
+  KENX:
+    latitude: 42.586556
+    longitude: -74.064083
+    region: CONUS
+  KBOX:
+    latitude: 41.955778
+    longitude: -71.136861
+    region: CONUS
+  KFWS:
+    latitude: 32.573
+    longitude: -97.30315
+    region: CONUS
+radars:
+  - KENX
+  - KBOX
+  - KYUX
+  - KBYX
+  - KTLX
+  - KVNX
+  - KLGX
+  - PAHG
+  - KFWS
+start_date: 2022-02-01
+end_date: 2022-03-01

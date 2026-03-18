@@ -1,0 +1,106 @@
+paths:
+  raw_root: "/home/ubuntu/data/MRMS/S3_V2/raw_store"         # Raw data root
+  nc_subset_root: "/home/ubuntu/data/MRMS/S3_V2/nc_subset"   # Preprocessed output root
+  snapshot_root: "/home/ubuntu/data/MRMS/S3_V2/snapshots"
+  runs_root: "/home/ubuntu/data/MRMS/S3_V2/runs"
+  db_dir: "/home/ubuntu/data/MRMS/S3_V2/_meta"
+
+sites: [
+  "KBOX",
+  "KBYX",
+  "KENX",
+  "KLGX",
+  "KTLX",
+  "KVNX",
+  "PAHG",
+#  "KYUX",
+]       # Example
+splits: ["train", "test"]
+
+windows:
+  - name: "1mo"
+    enabled: true
+#  - name: "3mo"
+#    enabled: true
+#  - name: "6mo"
+#    enabled: true
+#  - name: "12mo"
+#    enabled: true
+#  - name: "24mo"
+#    enabled: true
+#  - name: "48mo"
+#    enabled: true
+#  - name: "1q"
+#    enabled: false
+#  - name: "1y"
+#    enabled: false
+
+scan:
+  # Choose one: prefer explicit start/end; otherwise use backfill_months; defaults to 24 months when omitted
+  start: "2022-02-01"   # optional
+  end:   "2022-03-01"   # optional
+  backfill_months: 24   # optional
+
+freeze:
+  datasource: "s3"       # "mtarchive" or "s3"
+  freeze_lag_days: 3
+  missing_ratio_tol:
+      train: 0.25
+      test: 0.85
+  # Optional: extra parameters for S3/mtarchive directory listing
+#  mtarchive_base: "https://mtarchive.geol.iastate.edu"
+#  region: "CONUS"
+#  product: "PrecipRate"
+#  step_minutes: 2
+
+validation_policy:
+  name: "temporal_tail"
+  tail_days: 3
+  gap_hours: 2
+  seed: 20250925
+
+fl:
+  server_addr: "127.0.0.1:8080"
+  rounds: 50
+  local_steps: 2
+  clients_concurrency: 4
+  min_clients_to_start: 2
+  uv_activate: "source /home/zhexu/UMASS/SPRITE/federated_learning/.venv/bin/activate "
+  clients_map_template: "/home/zhexu/UMASS/SPRITE/federated_learning/src/flower/generationStep_and_data_splitting/clients.map.json"
+
+centralized:
+  uv_activate: "source /home/zhexu/UMASS/SPRITE/federated_learning/.venv/bin/activate "
+  run_centra_sh: "./run_centra.sh"
+
+slurm:
+  partition: "uri-gpu"
+  gpus: 1
+  cpus: 8
+  time: "7-00:00:00"
+
+orchestrator:
+  poll_interval_sec: 10
+  max_retries: 1
+
+  # Stage toggles (default false, do not skip)
+  skip_inventory: true    # Skip 0) inventory (walk_and_index_raw)
+  skip_freeze: true       # Skip 1) monthly freeze
+  skip_freeze_agg: true   # Skip 1b) aggregate 1q/1y manifests
+  skip_preproc: true      # Skip 2) preprocessing
+  skip_snapshot: true     # Skip 3) snapshot (sites & central)
+  skip_enqueue: false      # Skip 4) enqueue training jobs
+  skip_submit: false       # Skip 5) sbatch submission
+  skip_poll: false         # Skip 6) poll Slurm status
+  skip_retry: false        # Skip 7) retry failures
+
+
+raw_layout: "site/split/day"  # raw_store/{SITE}/{train|test}/{YYYYMMDD}/*.nc
+
+
+preprocessor:
+  enabled: true
+  # Prefer in-process helper call; only the config path is needed
+  config_yaml: "/home/zhexu/UMASS/SPRITE/casa_datatools/src/casa_datatools/processing_data/data_processing_config.yml"
+  # To force a subprocess entry point, provide entry_py and set prefer_inproc to false (see code toggle)
+  # entry_py: "/work/pi_mzink_umass_edu/SPRITE/federated/run_preprocessor.py"
+

@@ -1,0 +1,98 @@
+Hope you are doing well! I just finished running a one-month(Feb, 2022) example and attached the output files(please see the Google Drive link below). And the input(the config) is attached as the yaml file. The entrance of the main process is:
+
+1. Downloading raw MRMS data files from the AWS S3 datasource, entrance: `SPRITE/federated_learning/src/flower/dataloader/MRMS/fl_data_downloader.py`. Config file see attachment `download_config.yaml`
+2. Running the experiment, entrance: `SPRITE/federated_learning/src/flower/experiments/datasize_vs_acc/workflow/orchestrator.py`. Config file see attachment `experiment_config.yaml`
+3. The Model Compare Tool(MCT) can be launched by running command `model-compare-server` under path `SPRITE/model_compare_tool`. It is designed as an independent web-service and functions can be called through web-api(the initial idea was to avoid excessive logical coupling between experimental design and unified result validation tools.). After I review the gwas-qc-workflow example code, I think we can be focused on the 1 and 2 above first.
+
+About detailed code-output relationship and potential migrating idea,
+
+The `experiment1` orchestrator uses a state-driven pattern: stage execution is decided at runtime from database state plus filesystem markers (`_SUCCESS/_PARTIAL`).  
+`gwas-qc-workflow` uses a static DAG pattern: task dependencies are declared upfront and then executed by the scheduler.  
+The key distinction is whether runtime state checks are part of orchestration control flow.
+
+1. Orchestrator Flow, Entrypoints, and S3_V2 Artifacts (code-to-artifact mapping)
+
+- Entrypoint and config  
+  - Entrypoint script: `SPRITE/federated_learning/src/flower/sbatch_scripts/experiment1.sh`  
+  - Core pipeline: `SPRITE/federated_learning/src/flower/experiments/datasize_vs_acc/workflow/orchestrator.py`  
+  - Config: `SPRITE/federated_learning/src/flower/experiments/datasize_vs_acc/configs/experiment_datasize_vs_acc.yaml`
+
+- Step A: `inventory()` (`orchestrator.py`)  
+  - Calls: `core/inventory.py::walk_and_index_raw`  
+  - Output: `S3_V2/_meta/sprite.sqlite` (updates `raw_files` and related tables): Perhaps we can use PostgreSQL since SQLite has started to show some instability here?
+  - Input source: `S3_V2/raw_store/<SITE>/<split>/<YYYYMMDD>/*.nc`
+
+- Step B: `prepare_spans()` (`orchestrator.py`)  
+  - Function: computes `window/span` combinations from config and time bounds  
+  - Output: in-memory plan (no standalone file)
+
+- Step C: `freeze_months()` (`orchestrator.py`)  
+  - Calls: `audit/common.py::audit_and_freeze_month`  
+  - Output directory: `S3_V2/_meta/freeze_manifests/1mo/<SITE>/<split>/<YYYYMM>/`  
+  - Output files: `MANIFEST.json` + `_SUCCESS` or `_PARTIAL`  
+  - Current run example: `202202` is success, `202203` is partial
+
+- Step D: `aggregate_freeze()` (`orchestrator.py`)  
+  - Calls: `audit/common.py::aggregate_and_write_freeze`  
+  - Output directory (when enabled): `S3_V2/_meta/freeze_manifests/<period>/...`  
+  - Current example uses `1mo` only, so no major 1q/1y outputs
+
+- Step E: `trigger_preproc()` (`orchestrator.py`)  
+  - Calls: `workflow/preproc_bridge.py::run_preprocessor_for_frozen_month_site`  
+  - Marker outputs: `S3_V2/_meta/preproc_manifests/<SITE>/<YYYYMM>/_SUCCESS`  
+  - Staging outputs: `S3_V2/_meta/preproc_stage/<SITE>/<YYYYMM>/{train,test}/...`  
+  - Preprocessed data outputs:  
+    `S3_V2/nc_subset/<SITE>/no-normalization/precip-min:0.0_precip-max:128/{train,validation,test}/...`
+
+- Step F: `snapshot_site()` (`orchestrator.py`)  
+  - Calls: `core/snapshot.py::site_snapshot_window` and `central_snapshot_window`  
+  - Site snapshot outputs:  
+    `S3_V2/snapshots/sites/<SITE>/no-normalization/precip-min:0.0_precip-max:128/1mo/v001/span_2022-02/<split>/`  
+  - Central snapshot outputs:  
+    `S3_V2/snapshots/central/no-normalization/precip-min:0.0_precip-max:128/1mo/v001/span_2022-02/<split>/`  
+  - Per split outputs: `MANIFEST.json` + `_SUCCESS`
+
+- Step G: `enqueue_jobs()` (`orchestrator.py`)  
+  - Calls: `workflow/trainers.py` (writes run configs and FL mapping artifacts)  
+  - FL outputs:  
+    - `S3_V2/runs/fl/1mo/span_2022-02/run_001/config.yaml`  
+    - `S3_V2/runs/fl/1mo/span_2022-02/run_001/clients.map.json`  
+    - `S3_V2/runs/fl/1mo/span_2022-02/run_001/flwr.override.toml`  
+  - CEN outputs:  
+    - `S3_V2/runs/cen/1mo/span_2022-02/run_001/config.yaml`  
+  - Also writes queue records into `S3_V2/_meta/sprite.sqlite` (`jobs` table)
+
+- Step H: `submit_jobs()` / `poll_jobs()` / `retry_jobs()` (`orchestrator.py`)  
+  - Uses: `workflow/slurm_submit.py` + `slurm/fl_job.sbatch` + `slurm/cen_job.sbatch`  
+  - FL completion marker: `S3_V2/runs/fl/1mo/span_2022-02/run_001/_SUCCESS`  
+  - CEN completion marker: `S3_V2/runs/cen/1mo/span_2022-02/run_001/_SUCCESS`  
+  - Running marker (present): `.../_RUNNING`  
+  - DB state: `jobs` in `S3_V2/_meta/sprite.sqlite` marked `done`
+
+Note: this dataset is a `1mo` demonstration run; production runs can enable additional windows/spans via configuration (`3mo/6mo/12mo/1q/1y`, etc.).
+
+2. Migration Design (toward a gwas-qc-workflow-style structure)
+
+- Recommended organization  
+  - Orchestration layer: add a `workflow_generator.py` that only defines DAG, dependencies, resources, retries  
+  - Stage execution layer: add `bin/*.py` wrappers (one wrapper per stage, each calling existing modules)  
+  - Business logic layer: keep existing implementations in `federated_learning` and `model_compare_tool`
+
+- Stage decomposition idea: We can organize the overall workflow in `workflow_generator.py` and incorporate the implementation migrated from SPRITE to `bin/*.py`, as outlined below.
+  - `plan_spans`  
+  - `inventory`  
+  - `freeze`  
+  - `preproc`  
+  - `snapshot`  
+  - `enqueue_submit`  
+  - `poll_retry`  
+  - `model_compare_run`  
+  - `visual_compare`  
+  - `finalize_report`
+
+- Key constraints  
+  - Keep business truth in `S3_V2/_meta/sprite.sqlite` + manifests + `_SUCCESS/_PARTIAL`  
+  - Separate scheduler state (DAG/task lifecycle) from business state (data readiness/quality gates)  
+  - Keep window/span expansion configuration-driven, not hardcoded in DAG structure
+
+Google Drive Link to the example output files please `click here`.
