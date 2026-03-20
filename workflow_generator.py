@@ -197,7 +197,7 @@ class SpriteFlWorkflow:
             container_type=Container.SINGULARITY,
             image="docker://kthare10/sprite-fl:latest",
             image_site="docker_hub",
-        )
+        ).add_env(SINGULARITY_ARGS="--bind /home/ubuntu")
         self.tc.add_containers(container)
 
         transformations = []
