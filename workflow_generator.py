@@ -14,6 +14,7 @@ using tar archives as the data transfer unit between jobs:
     4. central_snapshot  -> central_snapshot.tar.gz
     5. prepare_configs   -> fl_configs.tar.gz
     6. finalize_report   -> final_report.json
+    7. visualize         -> pipeline_report.html
 
 No absolute paths, no bind mounts, no SQLite, no __DATA_ROOT__ tokens.
 All inter-job data flows through explicit Pegasus File objects.
@@ -48,6 +49,7 @@ TOOL_CONFIGS = {
     "central_snapshot":  {"memory": "4 GB",  "cores": 1},
     "prepare_configs":   {"memory": "2 GB",  "cores": 1},
     "finalize_report":   {"memory": "1 GB",  "cores": 1},
+    "visualize":         {"memory": "4 GB",  "cores": 1},
 }
 
 
@@ -313,6 +315,25 @@ class SpriteFlWorkflow:
             .add_outputs(report, stage_out=True, register_replica=False)
         )
         self.wf.add_jobs(finalize_job)
+
+        # ============================================================
+        # Visualize — generate HTML report with charts and maps
+        # ============================================================
+        viz_report = File("pipeline_report.html")
+
+        visualize_job = (
+            Job("visualize", _id="visualize",
+                node_label="visualize")
+            .add_args(
+                "--config", exp_config,
+                "--central-tar", central_tar,
+                "--configs-tar", configs_tar,
+                "--output", viz_report,
+            )
+            .add_inputs(exp_config, central_tar, configs_tar)
+            .add_outputs(viz_report, stage_out=True, register_replica=False)
+        )
+        self.wf.add_jobs(visualize_job)
 
 
 # ======================================================================

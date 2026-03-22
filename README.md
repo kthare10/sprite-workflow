@@ -5,48 +5,72 @@ Pegasus WMS workflow for the SPRITE project's federated learning pipeline on MRM
 ## Pipeline Overview
 
 ```
-download → inventory → plan_spans ─┬─> freeze_{site} → preproc_{site} → snapshot_{site} ──┐
-                                    ├─> ...  (parallel per site)                            ├→ central_snapshot
-                                    └─> freeze_{site} → preproc_{site} → snapshot_{site} ──┘        │
-                                                                                             enqueue_submit
-                                                                                                  │
-                                                                                             poll_retry
-                                                                                                  │
-                                                                                          finalize_report
+For each site (KBOX, KBYX, KENX, KLGX, KTLX, KVNX, PAHG):
+
+  download_{site} ──> preproc_{site} ──> snapshot_{site} ─┐
+  download_{site} ──> preproc_{site} ──> snapshot_{site} ──┤
+  ...               (parallel per site)                    ├──> central_snapshot ──> prepare_configs ──┬──> finalize_report
+  download_{site} ──> preproc_{site} ──> snapshot_{site} ──┘                                        └──> visualize
 ```
+
+All inter-job data flows through **tar archives** as explicit Pegasus `File` objects. No shared filesystem, no SQLite, no absolute paths.
 
 ### Stages
 
-| Stage | Script | Description |
-|-------|--------|-------------|
-| 1. Download | `bin/download.py` | Download MRMS data from AWS S3 |
-| 2. Inventory | `bin/inventory.py` | Index raw .nc files into SQLite |
-| 3. Plan Spans | `bin/plan_spans.py` | Compute window/span combinations from config |
-| 4. Freeze | `bin/freeze.py` | Audit & freeze monthly data (per-site, parallel) |
-| 5. Preprocess | `bin/preproc.py` | Preprocess frozen data (per-site, parallel) |
-| 6a. Snapshot | `bin/snapshot.py` | Create site snapshot (per-site, parallel) |
-| 6b. Central Snapshot | `bin/central_snapshot.py` | Merge all site snapshots |
-| 7. Enqueue/Submit | `bin/enqueue_submit.py` | Write run configs + submit FL/CEN training jobs |
-| 8. Poll/Retry | `bin/poll_retry.py` | Poll job status, retry failures |
-| 9. Finalize | `bin/finalize_report.py` | Generate final pipeline report |
+| Stage | Script | Input | Output | Description |
+|-------|--------|-------|--------|-------------|
+| 1. Download | `bin/download.py` | `download_config.yaml` | `{site}_raw.tar.gz` | Download MRMS data from AWS S3 for a single site |
+| 2. Preprocess | `bin/preproc.py` | `experiment_config.yaml`, raw tar | `{site}_sequences.tar.gz` | Index files, compute spans, verify completeness, group into sequences |
+| 3. Snapshot | `bin/snapshot.py` | `experiment_config.yaml`, sequences tar | `{site}_snapshot.tar.gz` | Organize sequences into versioned window/span/split structure |
+| 4. Central Snapshot | `bin/central_snapshot.py` | `experiment_config.yaml`, all site snapshot tars | `central_snapshot.tar.gz` | Merge all site snapshots with `__{SITE}` suffixes |
+| 5. Prepare Configs | `bin/prepare_configs.py` | `experiment_config.yaml`, central tar | `fl_configs.tar.gz` | Generate FL/centralized training configs with relative paths |
+| 6. Finalize | `bin/finalize_report.py` | `experiment_config.yaml`, central tar, configs tar | `final_report.json` | Summarize pipeline results |
+| 7. Visualize | `bin/visualize.py` | `experiment_config.yaml`, central tar, configs tar | `pipeline_report.html` | Generate HTML report with charts and precipitation maps |
+
+### Data Flow
+
+Each job is self-contained — it extracts input tar(s) to a local temp directory, does its work, and packages output into a new tar:
+
+```
+download_config.yaml ──> download_{site} ──> {site}_raw.tar.gz
+                                                    │
+experiment_config.yaml ──> preproc_{site} ──> {site}_sequences.tar.gz
+                                                    │
+experiment_config.yaml ──> snapshot_{site} ──> {site}_snapshot.tar.gz
+                                                    │
+                          central_snapshot ──> central_snapshot.tar.gz
+                                                    │
+                          prepare_configs ──> fl_configs.tar.gz
+                                                    │
+                          finalize_report ──> final_report.json  (staged out)
+                          visualize ────────> pipeline_report.html (staged out)
+```
 
 ## Configuration
 
 Two YAML config files drive the workflow:
 
-- **`download_config.yaml`** — S3 source, product, date range, station list, chunking
-- **`experiment_config.yaml`** — paths, sites, windows, freeze settings, FL/centralized training params, Slurm settings
+- **`download_config.yaml`** — S3 source, product, date range, station list with lat/lon, split settings
+- **`experiment_config.yaml`** — sites, splits, time windows, scan range, freeze thresholds, FL params, preprocessor settings
 
-Both configs use **placeholder tokens** instead of hardcoded paths:
+No placeholder tokens or path substitution. Configs are used as-is by every job.
 
-| Token | Replaced by | CLI flag | Env var fallback |
-|-------|-------------|----------|-----------------|
-| `__DATA_ROOT__` | Data storage root | `--data-root` | `$DATA_ROOT` |
-| `__FL_ROOT__` | Federated-learning code root | `--fl-root` | `$FL_ROOT` |
+### Key config sections
 
-At DAG generation time, `workflow_generator.py` reads the template configs, substitutes the placeholders with the resolved paths, and writes the resolved copies to `scratch/resolved_configs/`. The resolved configs are registered with Pegasus and passed to container jobs. `DATA_ROOT` and `FL_ROOT` are also injected as environment variables into every container job.
+**experiment_config.yaml:**
+- `sites` — list of radar site identifiers (e.g. KBOX, KBYX, ...)
+- `splits` — data splits (train, test)
+- `windows` — time window definitions with enabled flags (1mo, 3mo, ...)
+- `scan` — date range (start/end)
+- `freeze` — data completeness thresholds per split
+- `fl` — federated learning parameters (server, rounds, concurrency)
+- `preprocessor` — sequence length, gap tolerance, normalization tags
 
-Sites are read from `experiment_config.yaml` at DAG generation time to create parallel per-site branches.
+**download_config.yaml:**
+- `stations` — radar stations with latitude/longitude/region
+- `start_date` / `end_date` — download date range
+- `split` — train/test split ratio and seed
+- S3 source config (product, retries, clip degrees)
 
 ## Usage
 
@@ -59,18 +83,9 @@ pip install -r requirements.txt
 ### Generate the DAG
 
 ```bash
-# Minimal — uses $DATA_ROOT / $FL_ROOT env vars (or built-in defaults)
 python workflow_generator.py \
     --download-config download_config.yaml \
     --experiment-config experiment_config.yaml \
-    --output workflow.yml
-
-# Explicit roots
-python workflow_generator.py \
-    --download-config download_config.yaml \
-    --experiment-config experiment_config.yaml \
-    --data-root /data/MRMS/S3_V2 \
-    --fl-root /opt/SPRITE \
     --output workflow.yml
 ```
 
@@ -89,13 +104,11 @@ pegasus-status <run-dir>
 -o, --output                 Output file (default: workflow.yml)
 --download-config            Path to download_config.yaml (required)
 --experiment-config          Path to experiment_config.yaml (required)
---data-root PATH             Data storage root (default: $DATA_ROOT or /home/ubuntu/data/MRMS/S3_V2)
---fl-root PATH               Federated-learning code root (default: $FL_ROOT)
 ```
 
 ## Container
 
-The workflow uses a Singularity container pulled from `docker://kthare10/sprite-fl:latest`.
+The workflow uses a Singularity container pulled from `docker://kthare10/sprite-fl:latest`. No bind mounts are required — all jobs operate within their Pegasus-managed working directory.
 
 To build locally:
 
@@ -106,7 +119,49 @@ docker push kthare10/sprite-fl:latest
 
 ## Architecture
 
-- **Marker-file dependencies**: Each job produces a JSON marker file. Pegasus `infer_dependencies=True` auto-wires the DAG from File object matching.
-- **Config-driven fan-out**: `workflow_generator.py` reads `experiment_config.yaml` at generation time to determine the site list and creates N parallel branches.
-- **SQLite on shared filesystem**: All jobs access `sprite.sqlite` at a fixed path. Per-site jobs write non-overlapping rows. WAL mode enabled for concurrent access.
-- **Stub scripts**: Each `bin/` script has a clear interface (argparse CLI, JSON marker output) with stub implementations. Replace stubs with calls to existing SPRITE library code.
+- **Tar-based data flow**: Each job produces a tar.gz archive as its output File. Pegasus stages these between jobs automatically.
+- **Explicit dependencies**: `infer_dependencies=True` with `add_inputs()`/`add_outputs()` on Pegasus File objects wires the DAG.
+- **Config-driven fan-out**: `workflow_generator.py` reads `experiment_config.yaml` at generation time to create N parallel per-site branches (download → preproc → snapshot).
+- **Fan-in aggregation**: `central_snapshot` accepts all per-site snapshot tars and merges them with `__{SITE}` suffixed sequence directories.
+- **Relative paths only**: Training configs generated by `prepare_configs.py` use relative data paths, making them portable across execution environments.
+- **No shared state**: No SQLite database, no filesystem symlinks, no absolute paths. Each job is fully sandboxed.
+
+## Output
+
+Two staged-out artifacts are produced:
+
+### `final_report.json`
+
+Machine-readable pipeline summary:
+
+```json
+{
+  "stage": "finalize_report",
+  "status": "success",
+  "sites": ["KBOX", "KBYX", ...],
+  "central_snapshot": {
+    "total_sequences": 1234,
+    "splits": { ... }
+  },
+  "training_configs": {
+    "fl_runs": 1,
+    "cen_runs": 1,
+    "total_runs": 2
+  }
+}
+```
+
+### `pipeline_report.html`
+
+Self-contained HTML report with embedded visualizations:
+
+- **DAG diagram** — visual representation of the workflow structure
+- **Sequences per site** — bar chart showing data distribution across radar stations
+- **Data split heatmap** — train/test sequence counts per site
+- **Precipitation sample maps** — spatial heatmaps from sample .nc files for each site
+
+The report uses base64-embedded PNG images and requires no external dependencies to view.
+
+### Intermediate artifacts
+
+The `fl_configs.tar.gz` intermediate tar contains per-run config files (`config.yaml`, `clients.map.json`, `flwr.override.toml`) ready for use by downstream FL training infrastructure.
