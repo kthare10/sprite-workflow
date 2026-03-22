@@ -13,8 +13,10 @@ using tar archives as the data transfer unit between jobs:
   Then:
     4. central_snapshot  -> central_snapshot.tar.gz
     5. prepare_configs   -> fl_configs.tar.gz
-    6. finalize_report   -> final_report.json
-    7. visualize         -> pipeline_report.html
+    6. model_compare_run -> model_comparison.json
+    7. visual_compare    -> visual_comparison.html
+    8. finalize_report   -> final_report.json
+    9. visualize         -> pipeline_report.html
 
 No absolute paths, no bind mounts, no SQLite, no __DATA_ROOT__ tokens.
 All inter-job data flows through explicit Pegasus File objects.
@@ -48,6 +50,8 @@ TOOL_CONFIGS = {
     "snapshot":          {"memory": "4 GB",  "cores": 1},
     "central_snapshot":  {"memory": "4 GB",  "cores": 1},
     "prepare_configs":   {"memory": "2 GB",  "cores": 1},
+    "model_compare_run": {"memory": "4 GB",  "cores": 2},
+    "visual_compare":    {"memory": "4 GB",  "cores": 1},
     "finalize_report":   {"memory": "1 GB",  "cores": 1},
     "visualize":         {"memory": "4 GB",  "cores": 1},
 }
@@ -296,6 +300,46 @@ class SpriteFlWorkflow:
             .add_outputs(configs_tar, stage_out=False, register_replica=False)
         )
         self.wf.add_jobs(prepare_job)
+
+        # ============================================================
+        # Model comparison — compare FL vs centralized training results
+        # ============================================================
+        model_comparison = File("model_comparison.json")
+
+        model_compare_job = (
+            Job("model_compare_run", _id="model_compare_run",
+                node_label="model_compare_run")
+            .add_args(
+                "--config", exp_config,
+                "--configs-tar", configs_tar,
+                "--central-tar", central_tar,
+                "--output", model_comparison,
+            )
+            .add_inputs(exp_config, configs_tar, central_tar)
+            .add_outputs(model_comparison, stage_out=True,
+                         register_replica=False)
+        )
+        self.wf.add_jobs(model_compare_job)
+
+        # ============================================================
+        # Visual comparison — charts comparing FL vs CEN results
+        # ============================================================
+        visual_comparison = File("visual_comparison.html")
+
+        visual_compare_job = (
+            Job("visual_compare", _id="visual_compare",
+                node_label="visual_compare")
+            .add_args(
+                "--config", exp_config,
+                "--comparison", model_comparison,
+                "--central-tar", central_tar,
+                "--output", visual_comparison,
+            )
+            .add_inputs(exp_config, model_comparison, central_tar)
+            .add_outputs(visual_comparison, stage_out=True,
+                         register_replica=False)
+        )
+        self.wf.add_jobs(visual_compare_job)
 
         # ============================================================
         # Finalize report

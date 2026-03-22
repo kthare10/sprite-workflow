@@ -9,8 +9,16 @@ For each site (KBOX, KBYX, KENX, KLGX, KTLX, KVNX, PAHG):
 
   download_{site} ──> preproc_{site} ──> snapshot_{site} ─┐
   download_{site} ──> preproc_{site} ──> snapshot_{site} ──┤
-  ...               (parallel per site)                    ├──> central_snapshot ──> prepare_configs ──┬──> finalize_report
-  download_{site} ──> preproc_{site} ──> snapshot_{site} ──┘                                        └──> visualize
+  ...               (parallel per site)                    │
+  download_{site} ──> preproc_{site} ──> snapshot_{site} ──┘
+                                                           │
+                                                    central_snapshot
+                                                           │
+                                                    prepare_configs
+                                                      │         │
+                                              model_compare_run  ├──> finalize_report
+                                                      │         │
+                                               visual_compare    └──> visualize (pipeline report)
 ```
 
 All inter-job data flows through **tar archives** as explicit Pegasus `File` objects. No shared filesystem, no SQLite, no absolute paths.
@@ -24,8 +32,10 @@ All inter-job data flows through **tar archives** as explicit Pegasus `File` obj
 | 3. Snapshot | `bin/snapshot.py` | `experiment_config.yaml`, sequences tar | `{site}_snapshot.tar.gz` | Organize sequences into versioned window/span/split structure |
 | 4. Central Snapshot | `bin/central_snapshot.py` | `experiment_config.yaml`, all site snapshot tars | `central_snapshot.tar.gz` | Merge all site snapshots with `__{SITE}` suffixes |
 | 5. Prepare Configs | `bin/prepare_configs.py` | `experiment_config.yaml`, central tar | `fl_configs.tar.gz` | Generate FL/centralized training configs with relative paths |
-| 6. Finalize | `bin/finalize_report.py` | `experiment_config.yaml`, central tar, configs tar | `final_report.json` | Summarize pipeline results |
-| 7. Visualize | `bin/visualize.py` | `experiment_config.yaml`, central tar, configs tar | `pipeline_report.html` | Generate HTML report with charts and precipitation maps |
+| 6. Model Compare | `bin/model_compare_run.py` | `experiment_config.yaml`, configs tar, central tar | `model_comparison.json` | Compare FL vs centralized training results |
+| 7. Visual Compare | `bin/visual_compare.py` | `experiment_config.yaml`, comparison JSON, central tar | `visual_comparison.html` | Generate visual comparison charts (FL vs CEN) |
+| 8. Finalize | `bin/finalize_report.py` | `experiment_config.yaml`, central tar, configs tar | `final_report.json` | Summarize pipeline results |
+| 9. Visualize | `bin/visualize.py` | `experiment_config.yaml`, central tar, configs tar | `pipeline_report.html` | Generate HTML report with charts and precipitation maps |
 
 ### Data Flow
 
@@ -40,10 +50,14 @@ experiment_config.yaml ──> snapshot_{site} ──> {site}_snapshot.tar.gz
                                                     │
                           central_snapshot ──> central_snapshot.tar.gz
                                                     │
-                          prepare_configs ──> fl_configs.tar.gz
+                          prepare_configs  ──> fl_configs.tar.gz
                                                     │
-                          finalize_report ──> final_report.json  (staged out)
-                          visualize ────────> pipeline_report.html (staged out)
+                        model_compare_run  ──> model_comparison.json   (staged out)
+                                                    │
+                          visual_compare   ──> visual_comparison.html  (staged out)
+
+                          finalize_report  ──> final_report.json       (staged out)
+                          visualize ─────────> pipeline_report.html    (staged out)
 ```
 
 ## Configuration
@@ -51,7 +65,7 @@ experiment_config.yaml ──> snapshot_{site} ──> {site}_snapshot.tar.gz
 Two YAML config files drive the workflow:
 
 - **`download_config.yaml`** — S3 source, product, date range, station list with lat/lon, split settings
-- **`experiment_config.yaml`** — sites, splits, time windows, scan range, freeze thresholds, FL params, preprocessor settings
+- **`experiment_config.yaml`** — sites, splits, time windows, scan range, freeze thresholds, FL params, preprocessor settings, model comparison settings
 
 No placeholder tokens or path substitution. Configs are used as-is by every job.
 
@@ -65,6 +79,7 @@ No placeholder tokens or path substitution. Configs are used as-is by every job.
 - `freeze` — data completeness thresholds per split
 - `fl` — federated learning parameters (server, rounds, concurrency)
 - `preprocessor` — sequence length, gap tolerance, normalization tags
+- `model_compare` — MCT endpoint URL (optional), target accuracy threshold
 
 **download_config.yaml:**
 - `stations` — radar stations with latitude/longitude/region
@@ -121,35 +136,52 @@ docker push kthare10/sprite-fl:latest
 
 - **Tar-based data flow**: Each job produces a tar.gz archive as its output File. Pegasus stages these between jobs automatically.
 - **Explicit dependencies**: `infer_dependencies=True` with `add_inputs()`/`add_outputs()` on Pegasus File objects wires the DAG.
-- **Config-driven fan-out**: `workflow_generator.py` reads `experiment_config.yaml` at generation time to create N parallel per-site branches (download → preproc → snapshot).
+- **Config-driven fan-out**: `workflow_generator.py` reads `experiment_config.yaml` at generation time to create N parallel per-site branches (download -> preproc -> snapshot).
 - **Fan-in aggregation**: `central_snapshot` accepts all per-site snapshot tars and merges them with `__{SITE}` suffixed sequence directories.
+- **Model comparison**: `model_compare_run` compares FL vs centralized results using training logs/checkpoints. Optionally submits to a Model Compare Tool (MCT) web service.
 - **Relative paths only**: Training configs generated by `prepare_configs.py` use relative data paths, making them portable across execution environments.
 - **No shared state**: No SQLite database, no filesystem symlinks, no absolute paths. Each job is fully sandboxed.
 
 ## Output
 
-Two staged-out artifacts are produced:
+Four staged-out artifacts are produced:
 
-### `final_report.json`
+### `model_comparison.json`
 
-Machine-readable pipeline summary:
+Machine-readable comparison of FL vs centralized training:
 
 ```json
 {
-  "stage": "finalize_report",
+  "stage": "model_compare_run",
   "status": "success",
-  "sites": ["KBOX", "KBYX", ...],
-  "central_snapshot": {
-    "total_sequences": 1234,
-    "splits": { ... }
-  },
-  "training_configs": {
-    "fl_runs": 1,
-    "cen_runs": 1,
-    "total_runs": 2
-  }
+  "comparisons": [
+    {
+      "window": "1mo",
+      "span": "2022-02",
+      "fl": { "loss": 0.234, "accuracy": 0.891 },
+      "cen": { "loss": 0.198, "accuracy": 0.903 },
+      "delta": { "loss": 0.036, "accuracy": -0.012 },
+      "per_site_fl": { "KBOX": {...}, ... },
+      "convergence": { "fl_rounds_to_target": 25, "cen_epochs_to_target": 18 }
+    }
+  ],
+  "summary": { "mean_fl_accuracy": 0.891, "mean_cen_accuracy": 0.903, ... }
 }
 ```
+
+### `visual_comparison.html`
+
+Self-contained HTML report comparing FL and centralized approaches:
+
+- **Accuracy/loss bar charts** — FL vs CEN per window/span
+- **Convergence curves** — training loss and accuracy over rounds/epochs
+- **Per-site FL performance** — client-level accuracy breakdown
+- **Delta heatmap** — metric differences with significance indicators
+- **Summary statistics table** with t-test p-values
+
+### `final_report.json`
+
+Machine-readable pipeline summary with sequence counts, split distributions, and training config counts.
 
 ### `pipeline_report.html`
 
@@ -160,7 +192,7 @@ Self-contained HTML report with embedded visualizations:
 - **Data split heatmap** — train/test sequence counts per site
 - **Precipitation sample maps** — spatial heatmaps from sample .nc files for each site
 
-The report uses base64-embedded PNG images and requires no external dependencies to view.
+All HTML reports use base64-embedded PNG images and require no external dependencies to view.
 
 ### Intermediate artifacts
 

@@ -66,3 +66,8 @@ preprocessor:
   gap_minutes: 10
   normalization: "no-normalization"
   precip_range: "precip-min:0.0_precip-max:128"
+
+model_compare:
+  # MCT web service endpoint (optional; if unset, runs local comparison only)
+  # endpoint: "http://localhost:8000/api/compare"
+  target_accuracy: 0.8   # accuracy threshold for convergence analysis
