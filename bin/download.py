@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
 
-"""Download MRMS data from AWS S3.
+"""Download MRMS data from AWS S3 for a single site.
 
-Reads download_config.yaml for S3 source parameters, date range, station list,
-and chunk settings. Downloads .grib2.gz files, decompresses, clips to station
-bounding box, converts to NetCDF, and splits into train/test sets.
+Reads download_config.yaml for S3 source parameters, date range, and station
+settings. Downloads .grib2.gz files for the specified site, decompresses,
+clips to station bounding box, converts to NetCDF, splits into train/test,
+and packages all output into a tar archive.
 
-Produces a JSON marker file summarizing download results.
+Produces a single tar.gz file containing the site's raw .nc files organized
+as {split}/{YYYYMMDD}/{YYYYMMDD_HHMMSS}.nc.
 """
 
 import argparse
 import gzip
 import hashlib
-import json
 import logging
 import os
 import shutil
 import sys
+import tarfile
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -57,6 +59,8 @@ def download_and_convert_file(
     import time
 
     for attempt in range(1, max_attempts + 1):
+        tmp_gz_path = None
+        tmp_grib_path = None
         try:
             with tempfile.NamedTemporaryFile(suffix=".grib2.gz", delete=False) as tmp_gz:
                 tmp_gz_path = tmp_gz.name
@@ -72,6 +76,7 @@ def download_and_convert_file(
                     shutil.copyfileobj(f_in, f_out)
 
             os.unlink(tmp_gz_path)
+            tmp_gz_path = None
 
             # Open with xarray/cfgrib and clip
             import gc
@@ -121,7 +126,7 @@ def download_and_convert_file(
             ds.close()
             del ds
 
-            # Save as compressed NetCDF (matching reference format)
+            # Save as compressed NetCDF
             os.makedirs(os.path.dirname(out_path), exist_ok=True)
             encoding = {}
             for var in ds_clipped.data_vars:
@@ -149,7 +154,7 @@ def download_and_convert_file(
             )
             # Cleanup temp files
             for p in [tmp_gz_path, tmp_grib_path]:
-                if os.path.exists(p):
+                if p and os.path.exists(p):
                     os.unlink(p)
             if attempt < max_attempts:
                 import time
@@ -159,42 +164,42 @@ def download_and_convert_file(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Download MRMS data from AWS S3")
+    parser = argparse.ArgumentParser(description="Download MRMS data from AWS S3 for a single site")
     parser.add_argument("--config", required=True, help="Path to download_config.yaml")
-    parser.add_argument("--output-marker", required=True, help="Output JSON marker file")
+    parser.add_argument("--site", required=True, help="Site/radar identifier (e.g. KBOX)")
+    parser.add_argument("--output", required=True, help="Output tar.gz archive path")
     args = parser.parse_args()
 
-    logger.info(f"Config: {args.config}")
+    logger.info(f"Config: {args.config}, Site: {args.site}")
 
     with open(args.config, "r") as f:
         config = yaml.safe_load(f)
-
-    out_dir = os.path.dirname(args.output_marker)
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
 
     source = config.get("source", "s3")
     product = config.get("product", "PrecipRate")
     start_date = str(config.get("start_date", "2022-02-01"))
     end_date = str(config.get("end_date", "2022-03-01"))
-    radars = config.get("radars", [])
     stations = config.get("stations", {})
-    output_root = config.get("output", {}).get("root", "/tmp/mrms_download")
-    raw_store = config.get("output", {}).get("nc_subset", "/tmp/mrms_raw_store")
     chunks = config.get("chunks", 44)
     max_attempts = config.get("retries", {}).get("max_attempts", 3)
     base_delay = config.get("retries", {}).get("base_delay_seconds", 5)
     clip_deg = config.get("clip_degrees", 3)
-    split_mode = config.get("split", {}).get("mode", "random")
     split_ratio = config.get("split", {}).get("ratio", 0.2)
     split_seed = config.get("split", {}).get("seed", 2025)
-    step_minutes = config.get("audit", {}).get("step_minutes", 2)
+    step_minutes = config.get("step_minutes", 2)
+
+    station_info = stations.get(args.site, {})
+    if not station_info:
+        logger.error(f"Site {args.site} not found in stations config")
+        sys.exit(1)
+
+    lat = station_info.get("latitude", 0.0)
+    lon = station_info.get("longitude", 0.0)
+    region = station_info.get("region", "CONUS")
 
     logger.info(f"Source: {source}, Product: {product}")
     logger.info(f"Date range: {start_date} to {end_date}")
-    logger.info(f"Radars: {radars}")
-    logger.info(f"Output root: {output_root}, Raw store: {raw_store}")
-    logger.info(f"Chunks: {chunks}, Clip degrees: {clip_deg}")
+    logger.info(f"Site: {args.site} (lat={lat}, lon={lon}, region={region})")
 
     # Initialize boto3 S3 client (unsigned for public bucket)
     import boto3
@@ -204,7 +209,11 @@ def main():
     s3_client = boto3.client("s3", config=BotoConfig(signature_version=UNSIGNED))
     bucket = "noaa-mrms-pds"
 
-    # Build list of all download tasks
+    # Use a local temp directory for downloads
+    work_dir = tempfile.mkdtemp(prefix="sprite_download_")
+    logger.info(f"Working directory: {work_dir}")
+
+    # Build list of download tasks for this single site
     dt_start = datetime.strptime(start_date, "%Y-%m-%d")
     dt_end = datetime.strptime(end_date, "%Y-%m-%d")
 
@@ -214,27 +223,20 @@ def main():
         day_str = current.strftime("%Y%m%d")
         timestamps = generate_timestamps(day_str, step_minutes)
 
-        for radar in radars:
-            station_info = stations.get(radar, {})
-            lat = station_info.get("latitude", 0.0)
-            lon = station_info.get("longitude", 0.0)
-            region = station_info.get("region", "CONUS")
-
-            for hhmmss in timestamps:
-                ts_full = f"{day_str}_{hhmmss}"
-                split = ts_to_split(ts_full, ratio=split_ratio, seed=split_seed)
-                s3_key = (
-                    f"{region}/{product}_00.00/{day_str}/"
-                    f"MRMS_{product}_00.00_{day_str}-{hhmmss}.grib2.gz"
-                )
-                out_path = os.path.join(
-                    raw_store, radar, split, day_str, f"{day_str}_{hhmmss}.nc"
-                )
-                tasks.append((s3_key, radar, lat, lon, out_path, ts_full))
+        for hhmmss in timestamps:
+            ts_full = f"{day_str}_{hhmmss}"
+            split = ts_to_split(ts_full, ratio=split_ratio, seed=split_seed)
+            s3_key = (
+                f"{region}/{product}_00.00/{day_str}/"
+                f"MRMS_{product}_00.00_{day_str}-{hhmmss}.grib2.gz"
+            )
+            # Write to local temp dir: {split}/{YYYYMMDD}/{YYYYMMDD_HHMMSS}.nc
+            out_path = os.path.join(work_dir, split, day_str, f"{day_str}_{hhmmss}.nc")
+            tasks.append((s3_key, lat, lon, out_path, ts_full))
 
         current += timedelta(days=1)
 
-    logger.info(f"Total download tasks: {len(tasks)}")
+    logger.info(f"Total download tasks for {args.site}: {len(tasks)}")
 
     # Execute downloads in parallel
     downloaded_files = 0
@@ -242,11 +244,11 @@ def main():
     skipped_files = 0
 
     def do_download(task):
-        s3_key, radar, lat, lon, out_path, ts_full = task
+        s3_key, lat_, lon_, out_path, ts_full = task
         if os.path.exists(out_path):
             return "skipped"
         ok = download_and_convert_file(
-            s3_client, bucket, s3_key, radar, lat, lon,
+            s3_client, bucket, s3_key, args.site, lat_, lon_,
             clip_deg, out_path, max_attempts, base_delay,
         )
         return "ok" if ok else "fail"
@@ -269,31 +271,25 @@ def main():
                 )
 
     logger.info(
-        f"Download complete: {downloaded_files} ok, {failed_files} failed, "
-        f"{skipped_files} skipped out of {len(tasks)} total"
+        f"Download complete for {args.site}: {downloaded_files} ok, "
+        f"{failed_files} failed, {skipped_files} skipped out of {len(tasks)} total"
     )
 
-    marker = {
-        "stage": "download",
-        "status": "success" if failed_files == 0 else "partial",
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-        "source": source,
-        "product": product,
-        "start_date": start_date,
-        "end_date": end_date,
-        "radars": radars,
-        "output_root": output_root,
-        "nc_subset": raw_store,
-        "downloaded_files": downloaded_files,
-        "failed_files": failed_files,
-        "skipped_files": skipped_files,
-        "total_tasks": len(tasks),
-    }
+    # Package into tar.gz archive
+    logger.info(f"Creating output archive: {args.output}")
+    with tarfile.open(args.output, "w:gz") as tar:
+        for root, dirs, files in os.walk(work_dir):
+            for fname in sorted(files):
+                if not fname.endswith(".nc"):
+                    continue
+                full_path = os.path.join(root, fname)
+                arcname = os.path.relpath(full_path, work_dir)
+                tar.add(full_path, arcname=arcname)
 
-    with open(args.output_marker, "w") as f:
-        json.dump(marker, f, indent=2)
+    # Cleanup temp directory
+    shutil.rmtree(work_dir, ignore_errors=True)
 
-    logger.info(f"Marker written: {args.output_marker}")
+    logger.info(f"Output archive written: {args.output}")
 
 
 if __name__ == "__main__":

@@ -12,21 +12,7 @@ split:
   ratio: 0.2
   seed: 2025
   scope: ts
-output:
-  root: __DATA_ROOT__/download_opt
-  nc_subset: __DATA_ROOT__/raw_store
-  chunk_records_dir: __DATA_ROOT__/logs/downloading/chunk_records
-audit:
-  db_dir: __DATA_ROOT__/_meta
-  manifest_dir: __DATA_ROOT__/_meta/freeze_manifests
-  datasource: s3
-  freeze_lag_days: 3
-  missing_ratio_tol:
-    train: 0.25
-    test: 0.85
-  region: CONUS
-  product: PrecipRate
-  step_minutes: 2
+step_minutes: 2
 stations:
   KYUX:
     latitude: 32.495281

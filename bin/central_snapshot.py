@@ -2,18 +2,20 @@
 
 """Merge all site snapshots into a central snapshot.
 
-Reads site snapshot markers for all sites and creates a unified central
-snapshot directory. The central snapshot aggregates data across all sites
-for use by the federated learning server and centralized training.
+Accepts per-site snapshot tar archives and merges them into a single
+central snapshot tar. Sequences from different sites are distinguished
+by appending __{SITE} to the directory name.
 
-Corresponds to orchestrator Step F (central part): central_snapshot_window.
+No symlinks, no absolute paths.
 """
 
 import argparse
 import json
 import logging
 import os
-import sys
+import shutil
+import tarfile
+import tempfile
 from datetime import datetime
 
 import yaml
@@ -24,144 +26,116 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-NORM_TAG = "no-normalization"
-PRECIP_TAG = "precip-min:0.0_precip-max:128"
-NORM_TAG_COMBINED = f"{NORM_TAG}/{PRECIP_TAG}"
-VERSION = "v001"
-
 
 def main():
-    parser = argparse.ArgumentParser(description="Merge site snapshots into central")
+    parser = argparse.ArgumentParser(description="Merge site snapshots into central snapshot")
     parser.add_argument("--config", required=True, help="Path to experiment_config.yaml")
-    parser.add_argument("--site-marker", action="append", default=[],
-                        help="Site snapshot marker file (repeated per site)")
-    parser.add_argument("--output-marker", required=True, help="Output JSON marker file")
+    parser.add_argument("--site-tars", nargs="+", required=True,
+                        help="Per-site snapshot tar.gz archives")
+    parser.add_argument("--sites", nargs="+", required=True,
+                        help="Site names corresponding to --site-tars (same order)")
+    parser.add_argument("--output", required=True, help="Output central snapshot tar.gz archive")
     args = parser.parse_args()
 
     logger.info(f"Config: {args.config}")
-    logger.info(f"Site markers: {args.site_marker}")
+    logger.info(f"Sites: {args.sites}")
+    logger.info(f"Site tars: {args.site_tars}")
+
+    if len(args.site_tars) != len(args.sites):
+        logger.error("Number of --site-tars must match number of --sites")
+        import sys
+        sys.exit(1)
 
     with open(args.config, "r") as f:
         config = yaml.safe_load(f)
 
-    site_markers = []
-    for marker_path in args.site_marker:
-        with open(marker_path, "r") as f:
-            site_markers.append(json.load(f))
+    preproc_cfg = config.get("preprocessor", {})
+    norm_tag = preproc_cfg.get("normalization", "no-normalization")
+    precip_tag = preproc_cfg.get("precip_range", "precip-min:0.0_precip-max:128")
 
-    out_dir = os.path.dirname(args.output_marker)
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
-
-    snapshot_root = config.get("paths", {}).get("snapshot_root", "")
-    sites = [m.get("site", "unknown") for m in site_markers]
-
-    logger.info(f"Snapshot root: {snapshot_root}")
-    logger.info(f"Merging snapshots for sites: {sites}")
-
+    # Output temp directory for central snapshot
+    central_dir = tempfile.mkdtemp(prefix="sprite_central_")
     now = datetime.utcnow().isoformat() + "Z"
-    central_splits = {}
 
-    # Collect all (window, span_dir, split) combos from site markers
-    combos = set()
-    for sm in site_markers:
-        for split_key in sm.get("splits", {}):
-            # split_key like "1mo/span_2022-02/train"
-            parts = split_key.split("/")
-            if len(parts) == 3:
-                combos.add((parts[0], parts[1], parts[2]))
+    # Track (window, span_dir, split) -> seq_count for manifests
+    combo_counts = {}
 
-    for window, span_dir_name, split in sorted(combos):
-        # Central destination
-        central_dir = os.path.join(
-            snapshot_root, "central", NORM_TAG, PRECIP_TAG,
-            window, VERSION, span_dir_name, split,
-        )
-        os.makedirs(central_dir, exist_ok=True)
+    for site, tar_path in zip(args.sites, args.site_tars):
+        # Extract each site tar to temp dir
+        site_tmp = tempfile.mkdtemp(prefix=f"sprite_site_{site.lower()}_")
+        logger.info(f"Extracting {tar_path} for site {site}")
+        with tarfile.open(tar_path, "r:gz") as tar:
+            tar.extractall(site_tmp)
 
-        total_seq_count = 0
-        span_key = span_dir_name.replace("span_", "")  # "2022-02"
+        # Walk the extracted site snapshot
+        # Structure: {window}/v001/span_{YYYY-MM}/{split}/seq-*/*
+        for root, dirs, files in os.walk(site_tmp):
+            rel = os.path.relpath(root, site_tmp)
+            parts = rel.split(os.sep)
 
-        for sm in site_markers:
-            site = sm.get("site", "unknown")
-            split_key = f"{window}/{span_dir_name}/{split}"
-            split_info = sm.get("splits", {}).get(split_key, {})
-            site_snap_path = split_info.get("path", "")
+            # We're looking for sequence dirs at depth 4:
+            # {window}/v001/{span_dir}/{split}/{seq_dir}
+            if len(parts) >= 4:
+                window, version, span_dir, split = parts[0], parts[1], parts[2], parts[3]
 
-            if not site_snap_path or not os.path.isdir(site_snap_path):
-                site_snap_path = os.path.join(
-                    snapshot_root, "sites", site, NORM_TAG, PRECIP_TAG,
-                    window, VERSION, span_dir_name, split,
-                )
+                if len(parts) == 5:
+                    # This is a sequence directory
+                    seq_name = parts[4]
+                    dst_seq_name = f"{seq_name}__{site}"
+                    dst_path = os.path.join(
+                        central_dir, window, version, span_dir, split, dst_seq_name
+                    )
+                    if not os.path.exists(dst_path):
+                        shutil.copytree(root, dst_path)
 
-            if not os.path.isdir(site_snap_path):
-                logger.warning(f"Site snapshot dir not found: {site_snap_path}")
-                continue
+                    combo_key = (window, span_dir, split)
+                    combo_counts[combo_key] = combo_counts.get(combo_key, 0) + 1
 
-            for entry in sorted(os.listdir(site_snap_path)):
-                if entry in ("MANIFEST.json", "_SUCCESS") or entry.startswith("."):
-                    continue
-                src = os.path.join(site_snap_path, entry)
-                if not os.path.isdir(src) and not os.path.islink(src):
-                    continue
+                elif len(parts) == 4 and files:
+                    # This is the split directory level - skip manifest files,
+                    # they'll be regenerated
+                    pass
 
-                # Use double-underscore suffix: seq-16-1-0.0094726__KBOX
-                dst_name = f"{entry}__{site}"
-                dst = os.path.join(central_dir, dst_name)
-                if not os.path.exists(dst):
-                    real_src = os.path.realpath(src)
-                    try:
-                        os.symlink(real_src, dst)
-                    except OSError:
-                        import shutil
-                        shutil.copytree(real_src, dst)
-                total_seq_count += 1
+        shutil.rmtree(site_tmp, ignore_errors=True)
 
-        # Write central MANIFEST.json (matching reference format)
+    # Write central MANIFEST.json for each combo
+    for (window, span_dir, split), seq_count in sorted(combo_counts.items()):
+        combo_dir = os.path.join(central_dir, window, "v001", span_dir, split)
+        os.makedirs(combo_dir, exist_ok=True)
+
+        span_key = span_dir.replace("span_", "")
         manifest = {
             "level": "central",
             "split": split,
             "window": window,
             "span": span_key,
-            "version": VERSION,
-            "norm_tag": NORM_TAG_COMBINED,
-            "seq_count": total_seq_count,
-            "sites": sorted(sites),
+            "version": "v001",
+            "norm_tag": f"{norm_tag}/{precip_tag}",
+            "seq_count": seq_count,
+            "sites": sorted(args.sites),
             "created_at": now,
             "success": True,
         }
-        with open(os.path.join(central_dir, "MANIFEST.json"), "w") as f:
+        with open(os.path.join(combo_dir, "MANIFEST.json"), "w") as f:
             json.dump(manifest, f, indent=2)
 
-        # Write _SUCCESS marker
-        with open(os.path.join(central_dir, "_SUCCESS"), "w") as f:
-            pass
-
-        combo_key = f"{window}/{span_dir_name}/{split}"
-        central_splits[combo_key] = {
-            "seq_count": total_seq_count,
-            "path": central_dir,
-        }
-
         logger.info(
-            f"  central/{window}/{span_dir_name}/{split}: "
-            f"{total_seq_count} sequences from {len(sites)} sites"
+            f"  central/{window}/{span_dir}/{split}: "
+            f"{seq_count} sequences from {len(args.sites)} sites"
         )
 
-    marker = {
-        "stage": "central_snapshot",
-        "status": "success",
-        "timestamp": now,
-        "snapshot_root": snapshot_root,
-        "sites": sites,
-        "site_snapshot_count": len(site_markers),
-        "central_splits": central_splits,
-    }
+    # Package into tar.gz archive
+    logger.info(f"Creating output archive: {args.output}")
+    with tarfile.open(args.output, "w:gz") as tar:
+        for root, dirs, files in os.walk(central_dir):
+            for fname in sorted(files):
+                full_path = os.path.join(root, fname)
+                arcname = os.path.relpath(full_path, central_dir)
+                tar.add(full_path, arcname=arcname)
 
-    with open(args.output_marker, "w") as f:
-        json.dump(marker, f, indent=2)
+    shutil.rmtree(central_dir, ignore_errors=True)
 
-    logger.info(f"Marker written: {args.output_marker}")
+    logger.info(f"Output archive written: {args.output}")
 
 
 if __name__ == "__main__":

@@ -3,37 +3,31 @@
 """
 Pegasus workflow generator for SPRITE Federated Learning pipeline.
 
-Implements a multi-step pipeline for MRMS radar precipitation data:
-  1. Download raw MRMS data from AWS S3
-  2. Index raw .nc files into SQLite inventory
-  3. Compute window/span combinations from config
-  4. Per-site parallel branches:
-     a. Freeze (audit & freeze monthly data)
-     b. Preprocess frozen data
-     c. Create site snapshot
-  5. Merge all site snapshots into central snapshot
-  6. Enqueue and submit FL/centralized training jobs
-  7. Poll job status and retry failures
-  8. Generate final report
+Implements a Pegasus-native pipeline for MRMS radar precipitation data
+using tar archives as the data transfer unit between jobs:
+
+  For each site (KBOX, KBYX, KENX, KLGX, KTLX, KVNX, PAHG):
+    1. download_{site}  -> {site}_raw.tar.gz
+    2. preproc_{site}   -> {site}_sequences.tar.gz
+    3. snapshot_{site}   -> {site}_snapshot.tar.gz
+  Then:
+    4. central_snapshot  -> central_snapshot.tar.gz
+    5. prepare_configs   -> fl_configs.tar.gz
+    6. finalize_report   -> final_report.json
+
+No absolute paths, no bind mounts, no SQLite, no __DATA_ROOT__ tokens.
+All inter-job data flows through explicit Pegasus File objects.
 
 Usage:
     ./workflow_generator.py \\
         --download-config download_config.yaml \\
         --experiment-config experiment_config.yaml \\
         --output workflow.yml
-
-    ./workflow_generator.py \\
-        --download-config download_config.yaml \\
-        --experiment-config experiment_config.yaml \\
-        --data-root /data/MRMS/S3_V2 \\
-        --fl-root /opt/SPRITE \\
-        -e condorpool --output workflow.yml
 """
 
 import argparse
 import logging
 import os
-import shutil
 import sys
 from pathlib import Path
 
@@ -49,32 +43,12 @@ logger = logging.getLogger(__name__)
 # Per-tool resource configuration
 TOOL_CONFIGS = {
     "download":          {"memory": "8 GB",  "cores": 2},
-    "inventory":         {"memory": "2 GB",  "cores": 1},
-    "plan_spans":        {"memory": "1 GB",  "cores": 1},
-    "freeze":            {"memory": "2 GB",  "cores": 1},
     "preproc":           {"memory": "8 GB",  "cores": 2},
     "snapshot":          {"memory": "4 GB",  "cores": 1},
     "central_snapshot":  {"memory": "4 GB",  "cores": 1},
-    "enqueue_submit":    {"memory": "2 GB",  "cores": 1},
-    "poll_retry":        {"memory": "2 GB",  "cores": 1},
+    "prepare_configs":   {"memory": "2 GB",  "cores": 1},
     "finalize_report":   {"memory": "1 GB",  "cores": 1},
 }
-
-# Placeholder tokens replaced at DAG-generation time
-_DATA_ROOT_TOKEN = "__DATA_ROOT__"
-_FL_ROOT_TOKEN = "__FL_ROOT__"
-
-
-def resolve_config(template_path, out_path, data_root, fl_root):
-    """Read a YAML config template, replace placeholders, write resolved copy."""
-    with open(template_path, "r") as f:
-        text = f.read()
-    text = text.replace(_DATA_ROOT_TOKEN, data_root)
-    text = text.replace(_FL_ROOT_TOKEN, fl_root)
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    with open(out_path, "w") as f:
-        f.write(text)
-    return out_path
 
 
 class SpriteFlWorkflow:
@@ -96,14 +70,6 @@ class SpriteFlWorkflow:
     download_config_path = None
     experiment_config_path = None
 
-    # Resolved config paths (written to scratch dir)
-    resolved_download_config_path = None
-    resolved_experiment_config_path = None
-
-    # Root paths for placeholder substitution
-    data_root = None
-    fl_root = None
-
     # Parsed configs
     download_config = None
     experiment_config = None
@@ -115,26 +81,10 @@ class SpriteFlWorkflow:
         self.local_storage_dir = os.path.join(self.wf_dir, "output")
 
     def load_configs(self):
-        """Load config templates, resolve placeholders, and parse YAML."""
-        data_root = self.data_root or ""
-        fl_root = self.fl_root or ""
-
-        resolved_dir = os.path.join(self.shared_scratch_dir, "resolved_configs")
-
-        self.resolved_download_config_path = resolve_config(
-            self.download_config_path,
-            os.path.join(resolved_dir, "download_config.yaml"),
-            data_root, fl_root,
-        )
-        self.resolved_experiment_config_path = resolve_config(
-            self.experiment_config_path,
-            os.path.join(resolved_dir, "experiment_config.yaml"),
-            data_root, fl_root,
-        )
-
-        with open(self.resolved_download_config_path, "r") as f:
+        """Load and parse YAML config files directly (no token substitution)."""
+        with open(self.download_config_path, "r") as f:
             self.download_config = yaml.safe_load(f)
-        with open(self.resolved_experiment_config_path, "r") as f:
+        with open(self.experiment_config_path, "r") as f:
             self.experiment_config = yaml.safe_load(f)
 
     @property
@@ -197,7 +147,8 @@ class SpriteFlWorkflow:
             container_type=Container.SINGULARITY,
             image="docker://kthare10/sprite-fl:latest",
             image_site="docker_hub",
-        ).add_env(SINGULARITY_ARGS="--bind /home/ubuntu")
+        )
+        # No --bind /home/ubuntu, no DATA_ROOT env var
         self.tc.add_containers(container)
 
         transformations = []
@@ -222,28 +173,15 @@ class SpriteFlWorkflow:
     def create_replica_catalog(self):
         self.rc = ReplicaCatalog()
 
-        # Register resolved config files as input replicas
-        if self.resolved_download_config_path:
-            self.rc.add_replica(
-                "local", "download_config.yaml",
-                "file://" + os.path.abspath(self.resolved_download_config_path)
-            )
-        if self.resolved_experiment_config_path:
-            self.rc.add_replica(
-                "local", "experiment_config.yaml",
-                "file://" + os.path.abspath(self.resolved_experiment_config_path)
-            )
-
-    # ------------------------------------------------------------------
-    # Helper: add env vars to a job
-    # ------------------------------------------------------------------
-    def _add_env(self, job):
-        """Attach DATA_ROOT and FL_ROOT environment variables to a job."""
-        if self.data_root:
-            job.add_env(DATA_ROOT=self.data_root)
-        if self.fl_root:
-            job.add_env(FL_ROOT=self.fl_root)
-        return job
+        # Register config files as input replicas (original files, no token resolution)
+        self.rc.add_replica(
+            "local", "download_config.yaml",
+            "file://" + os.path.abspath(self.download_config_path)
+        )
+        self.rc.add_replica(
+            "local", "experiment_config.yaml",
+            "file://" + os.path.abspath(self.experiment_config_path)
+        )
 
     # ------------------------------------------------------------------
     # Workflow DAG
@@ -259,210 +197,121 @@ class SpriteFlWorkflow:
         exp_config = File("experiment_config.yaml")
 
         # ============================================================
-        # Step 1: Download MRMS data from AWS S3
+        # Per-site fan-out: download -> preproc -> snapshot
         # ============================================================
-        download_marker = File("download_marker.json")
-
-        download_job = (
-            Job("download", _id="download", node_label="download")
-            .add_args(
-                "--config", dl_config,
-                "--output-marker", download_marker,
-            )
-            .add_inputs(dl_config)
-            .add_outputs(download_marker, stage_out=True,
-                         register_replica=False)
-        )
-        self._add_env(download_job)
-        self.wf.add_jobs(download_job)
-
-        # ============================================================
-        # Step 2: Inventory — index raw .nc files into SQLite
-        # ============================================================
-        inventory_marker = File("inventory_marker.json")
-
-        inventory_job = (
-            Job("inventory", _id="inventory", node_label="inventory")
-            .add_args(
-                "--config", exp_config,
-                "--download-marker", download_marker,
-                "--output-marker", inventory_marker,
-            )
-            .add_inputs(exp_config, download_marker)
-            .add_outputs(inventory_marker, stage_out=True,
-                         register_replica=False)
-        )
-        self._add_env(inventory_job)
-        self.wf.add_jobs(inventory_job)
-
-        # ============================================================
-        # Step 3: Plan spans — compute window/span combinations
-        # ============================================================
-        plan_spans_marker = File("plan_spans_marker.json")
-
-        plan_spans_job = (
-            Job("plan_spans", _id="plan_spans", node_label="plan_spans")
-            .add_args(
-                "--config", exp_config,
-                "--inventory-marker", inventory_marker,
-                "--output-marker", plan_spans_marker,
-            )
-            .add_inputs(exp_config, inventory_marker)
-            .add_outputs(plan_spans_marker, stage_out=True,
-                         register_replica=False)
-        )
-        self._add_env(plan_spans_job)
-        self.wf.add_jobs(plan_spans_job)
-
-        # ============================================================
-        # Steps 4-6: Per-site parallel branches
-        #   freeze → preproc → snapshot (for each site)
-        # ============================================================
-        site_snapshot_markers = []
+        site_snapshot_tars = []
 
         for site in self.sites:
             site_lower = site.lower()
 
-            # Step 4: Freeze — audit & freeze monthly data (per-site)
-            freeze_marker = File(f"freeze_{site_lower}_marker.json")
+            # File objects for this site's pipeline
+            raw_tar = File(f"{site_lower}_raw.tar.gz")
+            seq_tar = File(f"{site_lower}_sequences.tar.gz")
+            snap_tar = File(f"{site_lower}_snapshot.tar.gz")
 
-            freeze_job = (
-                Job("freeze", _id=f"freeze_{site_lower}",
-                    node_label=f"freeze_{site_lower}")
+            # Step 1: Download MRMS data for this site
+            download_job = (
+                Job("download", _id=f"download_{site_lower}",
+                    node_label=f"download_{site_lower}")
                 .add_args(
-                    "--config", exp_config,
+                    "--config", dl_config,
                     "--site", site,
-                    "--plan-spans-marker", plan_spans_marker,
-                    "--output-marker", freeze_marker,
+                    "--output", raw_tar,
                 )
-                .add_inputs(exp_config, plan_spans_marker)
-                .add_outputs(freeze_marker, stage_out=True,
-                             register_replica=False)
+                .add_inputs(dl_config)
+                .add_outputs(raw_tar, stage_out=False, register_replica=False)
             )
-            self._add_env(freeze_job)
-            self.wf.add_jobs(freeze_job)
 
-            # Step 5: Preprocess frozen data (per-site)
-            preproc_marker = File(f"preproc_{site_lower}_marker.json")
-
+            # Step 2: Preprocess (inventory + spans + freeze + grouping)
             preproc_job = (
                 Job("preproc", _id=f"preproc_{site_lower}",
                     node_label=f"preproc_{site_lower}")
                 .add_args(
                     "--config", exp_config,
                     "--site", site,
-                    "--freeze-marker", freeze_marker,
-                    "--output-marker", preproc_marker,
+                    "--raw-tar", raw_tar,
+                    "--output", seq_tar,
                 )
-                .add_inputs(exp_config, freeze_marker)
-                .add_outputs(preproc_marker, stage_out=True,
-                             register_replica=False)
+                .add_inputs(exp_config, raw_tar)
+                .add_outputs(seq_tar, stage_out=False, register_replica=False)
             )
-            self._add_env(preproc_job)
-            self.wf.add_jobs(preproc_job)
 
-            # Step 6a: Site snapshot (per-site)
-            snapshot_marker = File(f"snapshot_{site_lower}_marker.json")
-
+            # Step 3: Create site snapshot
             snapshot_job = (
                 Job("snapshot", _id=f"snapshot_{site_lower}",
                     node_label=f"snapshot_{site_lower}")
                 .add_args(
                     "--config", exp_config,
                     "--site", site,
-                    "--preproc-marker", preproc_marker,
-                    "--output-marker", snapshot_marker,
+                    "--sequences-tar", seq_tar,
+                    "--output", snap_tar,
                 )
-                .add_inputs(exp_config, preproc_marker)
-                .add_outputs(snapshot_marker, stage_out=True,
-                             register_replica=False)
+                .add_inputs(exp_config, seq_tar)
+                .add_outputs(snap_tar, stage_out=False, register_replica=False)
             )
-            self._add_env(snapshot_job)
-            self.wf.add_jobs(snapshot_job)
 
-            site_snapshot_markers.append(snapshot_marker)
+            site_snapshot_tars.append(snap_tar)
+            self.wf.add_jobs(download_job, preproc_job, snapshot_job)
 
         # ============================================================
-        # Step 6b: Central snapshot — merge all site snapshots
+        # Fan-in: Central snapshot — merge all site snapshots
         # ============================================================
-        central_snapshot_marker = File("central_snapshot_marker.json")
+        central_tar = File("central_snapshot.tar.gz")
 
-        central_snapshot_job = (
+        central_job = (
             Job("central_snapshot", _id="central_snapshot",
                 node_label="central_snapshot")
+            .add_args("--config", exp_config)
+        )
+        # Add --site-tars and --sites arguments
+        central_job.add_args("--site-tars")
+        for snap_tar in site_snapshot_tars:
+            central_job.add_args(snap_tar)
+        central_job.add_args("--sites")
+        for site in self.sites:
+            central_job.add_args(site)
+        central_job.add_args("--output", central_tar)
+
+        central_job.add_inputs(exp_config, *site_snapshot_tars)
+        central_job.add_outputs(central_tar, stage_out=False,
+                                register_replica=False)
+        self.wf.add_jobs(central_job)
+
+        # ============================================================
+        # Prepare FL/centralized training configs
+        # ============================================================
+        configs_tar = File("fl_configs.tar.gz")
+
+        prepare_job = (
+            Job("prepare_configs", _id="prepare_configs",
+                node_label="prepare_configs")
             .add_args(
                 "--config", exp_config,
-                "--output-marker", central_snapshot_marker,
+                "--central-tar", central_tar,
+                "--output", configs_tar,
             )
+            .add_inputs(exp_config, central_tar)
+            .add_outputs(configs_tar, stage_out=False, register_replica=False)
         )
-        # Add all site snapshot markers as inputs
-        central_snapshot_job.add_inputs(exp_config)
-        for marker in site_snapshot_markers:
-            central_snapshot_job.add_args("--site-marker", marker)
-            central_snapshot_job.add_inputs(marker)
-        central_snapshot_job.add_outputs(
-            central_snapshot_marker, stage_out=True, register_replica=False
-        )
-        self._add_env(central_snapshot_job)
-        self.wf.add_jobs(central_snapshot_job)
+        self.wf.add_jobs(prepare_job)
 
         # ============================================================
-        # Step 7: Enqueue and submit FL/centralized training jobs
+        # Finalize report
         # ============================================================
-        enqueue_submit_marker = File("enqueue_submit_marker.json")
-
-        enqueue_submit_job = (
-            Job("enqueue_submit", _id="enqueue_submit",
-                node_label="enqueue_submit")
-            .add_args(
-                "--config", exp_config,
-                "--central-snapshot-marker", central_snapshot_marker,
-                "--output-marker", enqueue_submit_marker,
-            )
-            .add_inputs(exp_config, central_snapshot_marker)
-            .add_outputs(enqueue_submit_marker, stage_out=True,
-                         register_replica=False)
-        )
-        self._add_env(enqueue_submit_job)
-        self.wf.add_jobs(enqueue_submit_job)
-
-        # ============================================================
-        # Step 8: Poll job status and retry failures
-        # ============================================================
-        poll_retry_marker = File("poll_retry_marker.json")
-
-        poll_retry_job = (
-            Job("poll_retry", _id="poll_retry", node_label="poll_retry")
-            .add_args(
-                "--config", exp_config,
-                "--enqueue-submit-marker", enqueue_submit_marker,
-                "--output-marker", poll_retry_marker,
-            )
-            .add_inputs(exp_config, enqueue_submit_marker)
-            .add_outputs(poll_retry_marker, stage_out=True,
-                         register_replica=False)
-        )
-        self._add_env(poll_retry_job)
-        self.wf.add_jobs(poll_retry_job)
-
-        # ============================================================
-        # Step 9: Finalize report
-        # ============================================================
-        final_report = File("final_report.json")
+        report = File("final_report.json")
 
         finalize_job = (
             Job("finalize_report", _id="finalize_report",
                 node_label="finalize_report")
             .add_args(
                 "--config", exp_config,
-                "--poll-retry-marker", poll_retry_marker,
-                "--output-marker", final_report,
+                "--central-tar", central_tar,
+                "--configs-tar", configs_tar,
+                "--output", report,
             )
-            .add_inputs(exp_config, poll_retry_marker)
-            .add_outputs(final_report, stage_out=True,
-                         register_replica=False)
+            .add_inputs(exp_config, central_tar, configs_tar)
+            .add_outputs(report, stage_out=True, register_replica=False)
         )
-        self._add_env(finalize_job)
         self.wf.add_jobs(finalize_job)
 
 
@@ -480,7 +329,6 @@ Examples:
 
   %(prog)s --download-config download_config.yaml \\
            --experiment-config experiment_config.yaml \\
-           --data-root /data/MRMS/S3_V2 --fl-root /opt/SPRITE \\
            -e condorpool --output workflow.yml
 """,
     )
@@ -509,18 +357,6 @@ Examples:
         "--experiment-config", required=True,
         help="Path to experiment_config.yaml",
     )
-    parser.add_argument(
-        "--data-root", metavar="PATH",
-        default=os.environ.get("DATA_ROOT", "/home/ubuntu/data/MRMS/S3_V2"),
-        help="Root directory for data storage (replaces __DATA_ROOT__ in configs). "
-             "Default: $DATA_ROOT or /home/ubuntu/data/MRMS/S3_V2",
-    )
-    parser.add_argument(
-        "--fl-root", metavar="PATH",
-        default=os.environ.get("FL_ROOT", ""),
-        help="Root directory for federated-learning code (replaces __FL_ROOT__ in configs). "
-             "Default: $FL_ROOT env var",
-    )
 
     args = parser.parse_args()
 
@@ -539,8 +375,6 @@ Examples:
     logger.info(f"Download config:  {args.download_config}")
     logger.info(f"Experiment config: {args.experiment_config}")
     logger.info(f"Execution site:   {args.execution_site_name}")
-    logger.info(f"Data root:        {args.data_root}")
-    logger.info(f"FL root:          {args.fl_root}")
     logger.info(f"Output file:      {args.output}")
     logger.info("=" * 70)
 
@@ -548,8 +382,6 @@ Examples:
         workflow = SpriteFlWorkflow(dagfile=args.output)
         workflow.download_config_path = args.download_config
         workflow.experiment_config_path = args.experiment_config
-        workflow.data_root = args.data_root
-        workflow.fl_root = args.fl_root
         workflow.load_configs()
 
         logger.info(f"Sites: {workflow.sites}")
