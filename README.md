@@ -4,6 +4,11 @@ Pegasus WMS workflow for the SPRITE project's federated learning pipeline on MRM
 
 ## Pipeline Overview
 
+![Workflow DAG](images/workflow.png)
+
+<details>
+<summary>ASCII diagram</summary>
+
 ```
 For each site (KBOX, KBYX, KENX, KLGX, KTLX, KVNX, PAHG):
 
@@ -20,6 +25,7 @@ For each site (KBOX, KBYX, KENX, KLGX, KTLX, KVNX, PAHG):
                                                       │         │
                                                visual_compare    └──> visualize (pipeline report)
 ```
+</details>
 
 All inter-job data flows through **tar archives** as explicit Pegasus `File` objects. No shared filesystem, no SQLite, no absolute paths.
 
