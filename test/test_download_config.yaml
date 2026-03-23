@@ -1,0 +1,24 @@
+source: s3
+product: PrecipRate
+wgrib2_path: ../wgrib2
+chunks: 4
+sample_step: 1
+clip_degrees: 3
+retries:
+  max_attempts: 2
+  base_delay_seconds: 3
+split:
+  mode: random
+  ratio: 0.2
+  seed: 2025
+  scope: ts
+step_minutes: 60      # 1 file per hour = 24 files/day (vs 2-min = 720/day)
+stations:
+  KBOX:
+    latitude: 41.955778
+    longitude: -71.136861
+    region: CONUS
+radars:
+  - KBOX
+start_date: 2022-02-01
+end_date: 2022-02-02   # single day only

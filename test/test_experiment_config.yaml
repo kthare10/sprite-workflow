@@ -1,0 +1,46 @@
+sites: ["KBOX"]       # single site for testing
+splits: ["train", "test"]
+
+windows:
+  - name: "1mo"
+    enabled: true
+
+scan:
+  start: "2022-02-01"
+  end: "2022-02-02"   # match download range
+
+freeze:
+  datasource: "s3"
+  freeze_lag_days: 3
+  missing_ratio_tol:
+      train: 0.99    # relaxed for test (expect many missing files)
+      test: 0.99
+
+fl:
+  server_addr: "127.0.0.1:8080"
+  rounds: 50
+  local_steps: 2
+  clients_concurrency: 4
+  min_clients_to_start: 1
+
+slurm:
+  partition: "uri-gpu"
+  gpus: 1
+  cpus: 8
+  time: "1-00:00:00"
+
+orchestrator:
+  poll_interval_sec: 10
+  max_retries: 1
+
+raw_layout: "site/split/day"
+
+preprocessor:
+  enabled: true
+  sequence_length: 4    # shorter sequences for test (vs 16 in prod)
+  gap_minutes: 120      # wider gap tolerance for hourly data
+  normalization: "no-normalization"
+  precip_range: "precip-min:0.0_precip-max:128"
+
+model_compare:
+  target_accuracy: 0.5
