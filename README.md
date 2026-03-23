@@ -121,6 +121,36 @@ pegasus-status <run-dir>
 --experiment-config          Path to experiment_config.yaml (required)
 ```
 
+## Testing
+
+A minimal test harness runs all 9 stages locally without Pegasus, using reduced data (1 site, 1 day, hourly steps = ~24 S3 downloads).
+
+```bash
+# Full test (downloads from S3 + runs all stages)
+bash test/run_test.sh
+
+# Re-run without re-downloading (skips S3 if tar exists)
+bash test/run_test.sh --skip-download
+```
+
+Test config differences from production:
+
+| Setting | Production | Test |
+|---------|-----------|------|
+| Sites | 7 | 1 (KBOX) |
+| Date range | 1 month | 1 day |
+| Time step | 2 min (720/day) | 60 min (24/day) |
+| Sequence length | 16 | 4 |
+| Total downloads | ~140,000 | ~24 |
+| Freeze tolerance | 0.25/0.85 | 0.99 (relaxed) |
+
+Test outputs are written to `test/workdir/`. View the HTML reports:
+
+```bash
+open test/workdir/pipeline_report.html
+open test/workdir/visual_comparison.html
+```
+
 ## Container
 
 The workflow uses a Singularity container pulled from `docker://kthare10/sprite-fl:latest`. No bind mounts are required — all jobs operate within their Pegasus-managed working directory.
