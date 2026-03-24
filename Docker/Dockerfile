@@ -17,6 +17,7 @@ RUN pip3 install --no-cache-dir \
         pyyaml \
         numpy \
         pandas \
-        eccodes
+        eccodes \
+        matplotlib
 
 WORKDIR /opt/sprite
